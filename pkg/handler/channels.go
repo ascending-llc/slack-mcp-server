@@ -25,12 +25,12 @@ type Channel struct {
 }
 
 type ChannelsHandler struct {
-	apiProvider *provider.ApiProvider
+	apiProvider *provider.TokenBasedApiProvider
 	validTypes  map[string]bool
 	logger      *zap.Logger
 }
 
-func NewChannelsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger) *ChannelsHandler {
+func NewChannelsHandler(apiProvider *provider.TokenBasedApiProvider, logger *zap.Logger) *ChannelsHandler {
 	validTypes := make(map[string]bool, len(provider.AllChanTypes))
 	for _, v := range provider.AllChanTypes {
 		validTypes[v] = true
@@ -53,6 +53,8 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 	}
 
 	var channelList []Channel
+
+
 
 	if ready, err := ch.apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
@@ -105,10 +107,33 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 func (ch *ChannelsHandler) ChannelsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ChannelsHandler called")
 
+	// authentication
+	if authenticated, err := auth.IsAuthenticated(ctx, ch.apiProvider.ServerTransport(), ch.logger); !authenticated {
+		ch.logger.Error("Authentication failed for ChannelsHandler", zap.Error(err))
+		return nil, err
+	}
+	ch.logger.Debug("ChannelsHandler Authentication successful")
+
+	// Get client from context (token from HTTP Authorization header)
+    client, err := ch.apiProvider.GetClientFromContext(ctx)
+    if err != nil {
+        ch.logger.Error("Failed to get client from context", zap.Error(err))
+        return nil, err
+    }
+	// Access the embedded ApiProvider and set its client
+	ch.apiProvider.SetClient(client)
+	
+
+	ch.apiProvider.RefreshUsers(ctx)
+	ch.apiProvider.RefreshChannels(ctx)
+
+	ch.logger.Debug("ChannelsHandler Refresh finished")
+
 	if ready, err := ch.apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
 		return nil, err
 	}
+	ch.logger.Debug("ChannelsHandler initial checks passed")
 
 	sortType := request.GetString("sort", "popularity")
 	types := request.GetString("channel_types", provider.PubChanType)

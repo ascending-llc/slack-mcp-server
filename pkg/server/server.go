@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/handler"
@@ -21,7 +22,7 @@ type MCPServer struct {
 	logger *zap.Logger
 }
 
-func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer {
+func NewMCPServer(provider *provider.TokenBasedApiProvider, logger *zap.Logger) *MCPServer {
 	s := server.NewMCPServer(
 		"Slack MCP Server",
 		version.Version,
@@ -154,33 +155,46 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 			mcp.Description("Cursor for pagination. Use the value of the last row and column in the response as next_cursor field returned from the previous request."),
 		),
 	), channelsHandler.ChannelsHandler)
-
-	logger.Info("Authenticating with Slack API...",
-		zap.String("context", "console"),
-	)
-	ar, err := provider.Slack().AuthTest()
-	if err != nil {
-		logger.Fatal("Failed to authenticate with Slack",
+	
+	var ws string
+	if provider.Slack() == nil {
+		logger.Warn("No static Slack client available, skipping authentication check - OAuth-only mode",
 			zap.String("context", "console"),
-			zap.Error(err),
 		)
-	}
-
-	logger.Info("Successfully authenticated with Slack",
-		zap.String("context", "console"),
-		zap.String("team", ar.Team),
-		zap.String("user", ar.User),
-		zap.String("enterprise", ar.EnterpriseID),
-		zap.String("url", ar.URL),
-	)
-
-	ws, err := text.Workspace(ar.URL)
-	if err != nil {
-		logger.Fatal("Failed to parse workspace from URL",
+		ws = os.Getenv("SLACK_WORKSPACE_NAME")
+		if ws == "" {
+			logger.Fatal("SLACK_WORKSPACE_NAME environment variable is required in OAuth-only mode",
+				zap.String("context", "console"),
+			)
+		}
+	}else {
+		logger.Info("Authenticating with Slack API...",
 			zap.String("context", "console"),
+		)
+		ar, err := provider.Slack().AuthTest()
+		if err != nil {
+			logger.Fatal("Failed to authenticate with Slack",
+				zap.String("context", "console"),
+				zap.Error(err),
+			)
+		}
+
+		logger.Info("Successfully authenticated with Slack",
+			zap.String("context", "console"),
+			zap.String("team", ar.Team),
+			zap.String("user", ar.User),
+			zap.String("enterprise", ar.EnterpriseID),
 			zap.String("url", ar.URL),
-			zap.Error(err),
 		)
+		ws, err = text.Workspace(ar.URL)
+		if err != nil {
+			logger.Fatal("Failed to parse workspace from URL",
+				zap.String("context", "console"),
+				zap.String("url", ar.URL),
+				zap.Error(err),
+			)
+		}
+
 	}
 
 	s.AddResource(mcp.NewResource(

@@ -126,18 +126,19 @@ func main() {
 	}
 }
 
-func newUsersWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logger) func() {
+func newUsersWatcher(p *provider.TokenBasedApiProvider, once *sync.Once, logger *zap.Logger) func() {
 	return func() {
-		logger.Info("Caching users collection...",
-			zap.String("context", "console"),
-		)
-
-		if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
-			logger.Info("Demo credentials are set, skip",
+		// Skip user caching if no static client (OAuth-only mode)
+		if p.Slack() == nil {
+			logger.Info("Skipping user cache initialization - OAuth-only mode",
 				zap.String("context", "console"),
 			)
 			return
 		}
+
+		logger.Info("Caching users collection...",
+			zap.String("context", "console"),
+		)
 
 		err := p.RefreshUsers(context.Background())
 		if err != nil {
@@ -158,18 +159,19 @@ func newUsersWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logge
 	}
 }
 
-func newChannelsWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logger) func() {
+func newChannelsWatcher(p *provider.TokenBasedApiProvider, once *sync.Once, logger *zap.Logger) func() {
 	return func() {
-		logger.Info("Caching channels collection...",
-			zap.String("context", "console"),
-		)
-
-		if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
-			logger.Info("Demo credentials are set, skip.",
+		// Skip channel caching if no static client (OAuth-only mode)
+		if p.Slack() == nil {
+			logger.Info("Skipping channel cache initialization - OAuth-only mode",
 				zap.String("context", "console"),
 			)
 			return
 		}
+
+		logger.Info("Caching channels collection...",
+			zap.String("context", "console"),
+		)
 
 		err := p.RefreshChannels(context.Background())
 		if err != nil {

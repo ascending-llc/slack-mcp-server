@@ -80,11 +80,11 @@ type addMessageParams struct {
 }
 
 type ConversationsHandler struct {
-	apiProvider *provider.ApiProvider
+	apiProvider *provider.TokenBasedApiProvider
 	logger      *zap.Logger
 }
 
-func NewConversationsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger) *ConversationsHandler {
+func NewConversationsHandler(apiProvider *provider.TokenBasedApiProvider, logger *zap.Logger) *ConversationsHandler {
 	return &ConversationsHandler{
 		apiProvider: apiProvider,
 		logger:      logger,

@@ -2,14 +2,13 @@ package auth
 
 import (
 	"context"
-	"crypto/subtle"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/slack-go/slack"
 	"go.uber.org/zap"
 )
 
@@ -22,51 +21,49 @@ func withAuthKey(ctx context.Context, auth string) context.Context {
 }
 
 // Authenticate checks if the request is authenticated based on the provided context.
-func validateToken(ctx context.Context, logger *zap.Logger) (bool, error) {
-	// no configured token means no authentication
-	keyA := os.Getenv("SLACK_MCP_API_KEY")
-	if keyA == "" {
-		keyA = os.Getenv("SLACK_MCP_SSE_API_KEY")
-		if keyA != "" {
-			logger.Warn("SLACK_MCP_SSE_API_KEY is deprecated, please use SLACK_MCP_API_KEY")
-		}
-	}
 
-	if keyA == "" {
-		logger.Debug("No SSE API key configured, skipping authentication",
-			zap.String("context", "http"),
-		)
-		return true, nil
-	}
+// New OAuth token validation function
+func validateOAuthToken(ctx context.Context, logger *zap.Logger) (bool, error) {
+     // Debug: Print context information
+    logger.Debug("Context information in OAuth validation")
+	fmt.Printf("Context: %+v\n", ctx)
+    token, ok := ctx.Value(authKey{}).(string)
 
-	keyB, ok := ctx.Value(authKey{}).(string)
-	if !ok {
-		logger.Warn("Missing auth token in context",
-			zap.String("context", "http"),
-		)
-		return false, fmt.Errorf("missing auth")
-	}
+	fmt.Printf("Extracted token: %s, ok: %v\n", token, ok)
 
-	logger.Debug("Validating auth token",
-		zap.String("context", "http"),
-		zap.Bool("has_bearer_prefix", strings.HasPrefix(keyB, "Bearer ")),
-	)
+    if !ok {
+        logger.Warn("Missing OAuth token in context")
+        return false, fmt.Errorf("missing OAuth token")
+    }
 
-	if strings.HasPrefix(keyB, "Bearer ") {
-		keyB = strings.TrimPrefix(keyB, "Bearer ")
-	}
+    // Remove Bearer prefix if present
+    if strings.HasPrefix(token, "Bearer ") {
+        token = strings.TrimPrefix(token, "Bearer ")
+    }
 
-	if subtle.ConstantTimeCompare([]byte(keyA), []byte(keyB)) != 1 {
-		logger.Warn("Invalid auth token provided",
-			zap.String("context", "http"),
-		)
-		return false, fmt.Errorf("invalid auth token")
-	}
+    // Validate token with Slack API instead of local comparison
+    return validateWithSlack(token, logger)
+}
 
-	logger.Debug("Auth token validated successfully",
-		zap.String("context", "http"),
-	)
-	return true, nil
+// Validate token by calling Slack's auth.test API
+func validateWithSlack(token string, logger *zap.Logger) (bool, error) {
+    api := slack.New(token)
+    
+    // Test the token by calling auth.test
+    authTest, err := api.AuthTest()
+    if err != nil {
+        logger.Warn("Slack API auth.test failed", zap.Error(err))
+        return false, fmt.Errorf("token validation failed: %v", err)
+    }
+
+    // If we get here, the token is valid (no error from AuthTest)
+    logger.Debug("Token validated with Slack API",
+        zap.String("team", authTest.Team),
+        zap.String("user", authTest.User),
+        zap.String("user_id", authTest.UserID),
+        zap.String("team_id", authTest.TeamID))
+    
+    return true, nil
 }
 
 // AuthFromRequest extracts the auth token from the request headers.
@@ -115,7 +112,7 @@ func IsAuthenticated(ctx context.Context, transport string, logger *zap.Logger) 
 		return true, nil
 
 	case "sse", "http":
-		authenticated, err := validateToken(ctx, logger)
+		authenticated, err := validateOAuthToken(ctx, logger)
 
 		if err != nil {
 			logger.Error("HTTP/SSE authentication error",
@@ -141,4 +138,10 @@ func IsAuthenticated(ctx context.Context, transport string, logger *zap.Logger) 
 		)
 		return false, fmt.Errorf("unknown transport type: %s", transport)
 	}
+}
+
+// GetTokenFromContext extracts the token from context (public API)
+func GetTokenFromContext(ctx context.Context) (string, bool) {
+    token, ok := ctx.Value(authKey{}).(string)
+    return token, ok
 }
