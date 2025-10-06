@@ -1,20 +1,23 @@
 package server
 
 import (
-	"context"
-	"fmt"
-	"net/http"
-	"os"
-	"time"
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "os"
+    "strings"
+    "time"
 
-	"github.com/korotovsky/slack-mcp-server/pkg/handler"
-	"github.com/korotovsky/slack-mcp-server/pkg/provider"
-	"github.com/korotovsky/slack-mcp-server/pkg/server/auth"
-	"github.com/korotovsky/slack-mcp-server/pkg/text"
-	"github.com/korotovsky/slack-mcp-server/pkg/version"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
-	"go.uber.org/zap"
+    "github.com/korotovsky/slack-mcp-server/pkg/handler"
+    "github.com/korotovsky/slack-mcp-server/pkg/provider"
+    "github.com/korotovsky/slack-mcp-server/pkg/server/auth"
+    "github.com/korotovsky/slack-mcp-server/pkg/text"
+    "github.com/korotovsky/slack-mcp-server/pkg/version"
+    "github.com/mark3labs/mcp-go/mcp"
+    "github.com/mark3labs/mcp-go/server"
+    "github.com/slack-go/slack"
+    "go.uber.org/zap"
 )
 
 type MCPServer struct {
@@ -235,7 +238,7 @@ func (s *MCPServer) ServeSSE(addr string) *server.SSEServer {
 	)
 }
 
-func (s *MCPServer) ServeHTTP(addr string) *server.StreamableHTTPServer {
+func (s *MCPServer) ServeHTTP(addr string) error {
 	s.logger.Info("Creating HTTP server",
 		zap.String("context", "console"),
 		zap.String("version", version.Version),
@@ -243,14 +246,31 @@ func (s *MCPServer) ServeHTTP(addr string) *server.StreamableHTTPServer {
 		zap.String("commit_hash", version.CommitHash),
 		zap.String("address", addr),
 	)
-	return server.NewStreamableHTTPServer(s.server,
-		server.WithEndpointPath("/mcp"),
-		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
-			ctx = auth.AuthFromRequest(s.logger)(ctx, r)
+	mcpServer := server.NewStreamableHTTPServer(s.server,
+        server.WithEndpointPath("/mcp"),
+        server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
+            // Extract auth token and add to context
+            ctx = auth.AuthFromRequest(s.logger)(ctx, r)
+            return ctx
+        }),
+    )
 
-			return ctx
-		}),
-	)
+    // Create HTTP mux with authentication middleware
+    mux := http.NewServeMux()
+    
+    // Add authenticated MCP endpoint
+    mux.Handle("/mcp", s.httpAuthMiddleware(mcpServer))
+    
+    // Add health check endpoint (no auth required)
+    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte(`{"status":"ok"}`))
+    })
+
+    // Start server
+    s.logger.Info("HTTP server listening", zap.String("address", addr))
+    return http.ListenAndServe(addr, mux)
 }
 
 func (s *MCPServer) ServeStdio() error {
@@ -288,4 +308,100 @@ func buildLoggerMiddleware(logger *zap.Logger) server.ToolHandlerMiddleware {
 			return res, err
 		}
 	}
+}
+
+// httpAuthMiddleware wraps an HTTP handler with authentication
+func (s *MCPServer) httpAuthMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        s.logger.Debug("HTTP auth middleware",
+            zap.String("method", r.Method),
+            zap.String("path", r.URL.Path),
+        )
+		 // Print all headers
+        fmt.Printf("Request: %+v\n", r)
+		// Handle CORS preflight (OPTIONS) requests - no auth required
+        if r.Method == http.MethodOptions {
+            s.logger.Debug("CORS preflight request, skipping auth",
+                zap.String("origin", r.Header.Get("Origin")),
+            )
+            w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+            w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, HEAD")
+            w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
+            w.WriteHeader(http.StatusNoContent) // 204 No Content
+            return
+        }
+
+        // Only check authentication for POST and HEAD requests
+		if r.Method == http.MethodPost || r.Method == http.MethodHead {
+			s.logger.Debug("Checking authentication",
+				zap.String("method", r.Method),
+			)
+
+			// Check Authorization header
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				s.sendHTTP401(w, "missing_authorization",
+					"Missing authorization header",
+					"Include 'Authorization: Bearer <token>' header in your request")
+				return
+			}
+
+
+			// Extract and validate token
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			if !s.validateToken(token) {
+				s.sendHTTP401(w, "invalid_token",
+					"Invalid or expired token",
+					"Check your token validity or refresh your OAuth token")
+				return
+			}
+
+			s.logger.Debug("HTTP authentication successful")
+		} else {
+			s.logger.Debug("Skipping authentication for method",
+				zap.String("method", r.Method),
+			)
+		}
+
+		// Add CORS headers to actual responses
+		if origin := r.Header.Get("Origin"); origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+
+		// Authentication passed (or not required), continue to MCP handler
+		next.ServeHTTP(w, r)
+    })
+}
+
+// sendHTTP401 sends a 401 Unauthorized response
+func (s *MCPServer) sendHTTP401(w http.ResponseWriter, errorType, message, hint string) {
+    s.logger.Warn("Sending HTTP 401",
+        zap.String("error_type", errorType),
+        zap.String("message", message),
+    )
+
+    w.Header().Set("Content-Type", "application/json")
+    w.Header().Set("WWW-Authenticate", `Bearer realm="Slack MCP Server"`)
+    w.WriteHeader(http.StatusUnauthorized)
+
+    response := map[string]interface{}{
+        "error":   errorType,
+        "message": message,
+        "hint":    hint,
+        "status":  401,
+        "type":    "authentication_required",
+    }
+
+    json.NewEncoder(w).Encode(response)
+}
+
+// validateToken validates the OAuth token with Slack API
+func (s *MCPServer) validateToken(token string) bool {
+    api := slack.New(token)
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    _, err := api.AuthTestContext(ctx)
+    return err == nil
 }

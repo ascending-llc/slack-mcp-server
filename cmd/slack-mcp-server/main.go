@@ -97,22 +97,9 @@ func main() {
 			port = strconv.Itoa(defaultSsePort)
 		}
 
-		httpServer := s.ServeHTTP(":" + port)
-		logger.Info(
-			fmt.Sprintf("HTTP server listening on %s", fmt.Sprintf("%s:%s", host, port)),
-			zap.String("context", "console"),
-			zap.String("host", host),
-			zap.String("port", port),
-		)
-
-		if ready, _ := p.IsReady(); !ready {
-			logger.Info("Slack MCP Server is still warming up caches",
-				zap.String("context", "console"),
-			)
-		}
-
-		if err := httpServer.Start(host + ":" + port); err != nil {
-			logger.Fatal("Server error",
+		addr := host + ":" + port
+		if err := s.ServeHTTP(addr); err != nil {
+			logger.Fatal("HTTP server error",
 				zap.String("context", "console"),
 				zap.Error(err),
 			)
