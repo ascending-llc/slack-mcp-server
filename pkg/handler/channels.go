@@ -51,6 +51,9 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 		ch.logger.Error("Authentication failed for channels resource", zap.Error(err))
 		return nil, err
 	}
+	
+	ch.apiProvider.RefreshUsers(ctx)
+	ch.apiProvider.RefreshChannels(ctx)
 
 	var channelList []Channel
 

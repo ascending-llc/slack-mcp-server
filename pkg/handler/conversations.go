@@ -101,6 +101,9 @@ func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.R
 		return nil, err
 	}
 
+	ch.apiProvider.RefreshUsers(ctx)
+	ch.apiProvider.RefreshChannels(ctx)
+
 	// provider readiness
 	if ready, err := ch.apiProvider.IsReady(); !ready {
 		ch.logger.Error("API provider not ready", zap.Error(err))
