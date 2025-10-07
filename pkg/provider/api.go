@@ -2,10 +2,10 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
+	// "encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	// "io/ioutil"
 	"net/http"
 	"os"
 	"strings"
@@ -94,12 +94,12 @@ type ApiProvider struct {
 
 	users      map[string]slack.User
 	usersInv   map[string]string
-	usersCache string
+	// usersCache string
 	usersReady bool
 
 	channels      map[string]Channel
 	channelsInv   map[string]string
-	channelsCache string
+	// channelsCache string
 	channelsReady bool
 }
 
@@ -364,15 +364,6 @@ func New(transport string, logger *zap.Logger) *TokenBasedApiProvider {
 
 // newBaseProvider creates a base ApiProvider without a client
 func newBaseProvider(transport string, logger *zap.Logger) *ApiProvider {
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
-	}
-
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache_v2.json"
-	}
 
 	return &ApiProvider{
 		transport: transport,
@@ -383,11 +374,11 @@ func newBaseProvider(transport string, logger *zap.Logger) *ApiProvider {
 
 		users:      make(map[string]slack.User),
 		usersInv:   map[string]string{},
-		usersCache: usersCache,
+		// usersCache: usersCache,
 
 		channels:      make(map[string]Channel),
 		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+		// channelsCache: channelsCache,
 	}
 }
 
@@ -416,29 +407,7 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
 
-	ap.logger.Debug("RefreshUsers called", zap.String("cache_file", ap.usersCache))
-
-
-	if data, err := ioutil.ReadFile(ap.usersCache); err == nil {
-		ap.logger.Debug("readfile called")
-
-		var cachedUsers []slack.User
-		if err := json.Unmarshal(data, &cachedUsers); err != nil {
-			ap.logger.Warn("Failed to unmarshal users cache, will refetch",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			for _, u := range cachedUsers {
-				ap.users[u.ID] = u
-				ap.usersInv[u.Name] = u.ID
-			}
-			ap.logger.Info("Loaded users from cache",
-				zap.Int("count", len(cachedUsers)),
-				zap.String("cache_file", ap.usersCache))
-			ap.usersReady = true
-			return nil
-		}
-	}
+	ap.logger.Debug("RefreshUsers called - fetching from Slack API")
 
 	users, err := ap.client.GetUsersContext(ctx,
 		optionLimit,
@@ -470,20 +439,8 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		ap.usersInv[user.Name] = user.ID
 		usersCounter++
 	}
-
-	if data, err := json.MarshalIndent(list, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal users for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.usersCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote users to cache",
-				zap.Int("count", usersCounter),
-				zap.String("cache_file", ap.usersCache))
-		}
-	}
+	ap.logger.Info("Loaded users from Slack API",
+        zap.Int("count", usersCounter))
 
 	ap.usersReady = true
 
@@ -491,41 +448,11 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 }
 
 func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
-	if data, err := ioutil.ReadFile(ap.channelsCache); err == nil {
-		var cachedChannels []Channel
-		if err := json.Unmarshal(data, &cachedChannels); err != nil {
-			ap.logger.Warn("Failed to unmarshal channels cache, will refetch",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			for _, c := range cachedChannels {
-				ap.channels[c.ID] = c
-				ap.channelsInv[c.Name] = c.ID
-			}
-			ap.logger.Info("Loaded channels from cache",
-				zap.Int("count", len(cachedChannels)),
-				zap.String("cache_file", ap.channelsCache))
-			ap.channelsReady = true
-			return nil
-		}
-	}
 
 	channels := ap.GetChannels(ctx, AllChanTypes)
 
-	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.channelsCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote channels to cache",
-				zap.Int("count", len(channels)),
-				zap.String("cache_file", ap.channelsCache))
-		}
-	}
-
+	ap.logger.Info("Loaded channels from Slack API",
+        zap.Int("count", len(channels)))
 	ap.channelsReady = true
 
 	return nil
