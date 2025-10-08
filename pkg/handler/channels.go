@@ -51,20 +51,31 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 		ch.logger.Error("Authentication failed for channels resource", zap.Error(err))
 		return nil, err
 	}
-	
-	ch.apiProvider.RefreshUsers(ctx)
-	ch.apiProvider.RefreshChannels(ctx)
 
-	var channelList []Channel
-
-
-
-	if ready, err := ch.apiProvider.IsReady(); !ready {
-		ch.logger.Error("API provider not ready", zap.Error(err))
+	// Get client for this request (cached by token)
+	client, err := ch.apiProvider.GetClientFromContext(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to get client from context", zap.Error(err))
 		return nil, err
 	}
 
-	ar, err := ch.apiProvider.Slack().AuthTest()
+	// Fetch users for this request only
+	usersCache, err := ch.apiProvider.FetchUsersForRequest(ctx, client)
+	if err != nil {
+		ch.logger.Error("Failed to fetch users", zap.Error(err))
+		return nil, err
+	}
+
+	// Fetch channels for this request only
+	channelsCache, err := ch.apiProvider.FetchChannelsForRequest(ctx, client, usersCache, provider.AllChanTypes)
+	if err != nil {
+		ch.logger.Error("Failed to fetch channels", zap.Error(err))
+		return nil, err
+	}
+
+	var channelList []Channel
+
+	ar, err := client.AuthTest()
 	if err != nil {
 		ch.logger.Error("Auth test failed", zap.Error(err))
 		return nil, err
@@ -79,8 +90,8 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 		return nil, fmt.Errorf("failed to parse workspace from URL: %v", err)
 	}
 
-	channels := ch.apiProvider.ProvideChannelsMaps().Channels
-	ch.logger.Debug("Retrieved channels from provider", zap.Int("count", len(channels)))
+	channels := channelsCache.Channels
+	ch.logger.Debug("Retrieved channels from request", zap.Int("count", len(channels)))
 
 	for _, channel := range channels {
 		channelList = append(channelList, Channel{
@@ -117,26 +128,28 @@ func (ch *ChannelsHandler) ChannelsHandler(ctx context.Context, request mcp.Call
 	}
 	ch.logger.Debug("ChannelsHandler Authentication successful")
 
-	// Get client from context (token from HTTP Authorization header)
-    client, err := ch.apiProvider.GetClientFromContext(ctx)
-    if err != nil {
-        ch.logger.Error("Failed to get client from context", zap.Error(err))
-        return nil, err
-    }
-	// Access the embedded ApiProvider and set its client
-	ch.apiProvider.SetClient(client)
-	
-
-	ch.apiProvider.RefreshUsers(ctx)
-	ch.apiProvider.RefreshChannels(ctx)
-
-	ch.logger.Debug("ChannelsHandler Refresh finished")
-
-	if ready, err := ch.apiProvider.IsReady(); !ready {
-		ch.logger.Error("API provider not ready", zap.Error(err))
+	// Get client for this request (cached by token)
+	client, err := ch.apiProvider.GetClientFromContext(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to get client from context", zap.Error(err))
 		return nil, err
 	}
-	ch.logger.Debug("ChannelsHandler initial checks passed")
+
+	// Fetch users for this request only
+	usersCache, err := ch.apiProvider.FetchUsersForRequest(ctx, client)
+	if err != nil {
+		ch.logger.Error("Failed to fetch users", zap.Error(err))
+		return nil, err
+	}
+
+	// Fetch channels for this request only
+	channelsCache, err := ch.apiProvider.FetchChannelsForRequest(ctx, client, usersCache, provider.AllChanTypes)
+	if err != nil {
+		ch.logger.Error("Failed to fetch channels", zap.Error(err))
+		return nil, err
+	}
+
+	ch.logger.Debug("ChannelsHandler data fetch complete")
 
 	sortType := request.GetString("sort", "popularity")
 	types := request.GetString("channel_types", provider.PubChanType)
@@ -184,7 +197,7 @@ func (ch *ChannelsHandler) ChannelsHandler(ctx context.Context, request mcp.Call
 		channelList []Channel
 	)
 
-	allChannels := ch.apiProvider.ProvideChannelsMaps().Channels
+	allChannels := channelsCache.Channels
 	ch.logger.Debug("Total channels available", zap.Int("count", len(allChannels)))
 
 	channels := filterChannelsByTypes(allChannels, channelTypes)

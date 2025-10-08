@@ -8,8 +8,12 @@ import (
 	// "io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/cache"
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider/edge"
 	"github.com/korotovsky/slack-mcp-server/pkg/transport"
@@ -106,6 +110,10 @@ type ApiProvider struct {
 // TokenBasedApiProvider supports creating clients from tokens dynamically
 type TokenBasedApiProvider struct {
 	*ApiProvider
+	
+	// LRU cache for per-token clients (replaces unbounded map)
+	clientCache *cache.LRUCache
+	cacheMutex  sync.RWMutex
 }
 
 // CreateClientFromToken creates a new Slack client from an OAuth token
@@ -120,15 +128,8 @@ func (tap *TokenBasedApiProvider) GetClientFromContext(ctx context.Context) (Sla
 		return tap.client, nil
 	}
 
-	 // Debug: Print context information
-    tap.logger.Debug("Context information in CLIENT validation")
-	fmt.Printf("Context: %+v\n", ctx)
-
 	// Extract token from context (set by AuthFromRequest)
 	token, ok := localauth.GetTokenFromContext(ctx)
-
-	fmt.Printf("Extracted token: %s, ok: %v\n", token, ok)
-
 	if !ok {
 		return nil, fmt.Errorf("no authentication token found in context")
 	}
@@ -138,8 +139,35 @@ func (tap *TokenBasedApiProvider) GetClientFromContext(ctx context.Context) (Sla
 		token = strings.TrimPrefix(token, "Bearer ")
 	}
 
-	// Create client from token
-	return tap.CreateClientFromToken(token)
+	// Check cache first
+	if cachedClient, found := tap.clientCache.Get(token); found {
+		tap.logger.Debug("Using cached client for token")
+		return cachedClient.(SlackAPI), nil
+	}
+
+	// Need to create new client
+	tap.cacheMutex.Lock()
+	defer tap.cacheMutex.Unlock()
+
+	// Double-check pattern - another goroutine may have created it
+	if cachedClient, found := tap.clientCache.Get(token); found {
+		tap.logger.Debug("Using cached client for token (from double-check)")
+		return cachedClient.(SlackAPI), nil
+	}
+
+	// Create new client
+	tap.logger.Debug("Creating new client for token")
+	client, err := tap.CreateClientFromToken(token)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache it
+	tap.clientCache.Set(token, client)
+	tap.logger.Debug("Cached new client for token",
+		zap.Int("cache_size", tap.clientCache.Len()))
+
+	return client, nil
 }
 
 func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlackClient, error) {
@@ -340,6 +368,29 @@ func New(transport string, logger *zap.Logger) *TokenBasedApiProvider {
 	// Create base provider
 	baseProvider := newBaseProvider(transport, logger)
 	
+	// Get cache configuration from environment
+	cacheCapacity := 100 // Default: 100 clients
+	if capacityStr := os.Getenv("SLACK_MCP_CLIENT_CACHE_SIZE"); capacityStr != "" {
+		if capacity, err := strconv.Atoi(capacityStr); err == nil && capacity > 0 {
+			cacheCapacity = capacity
+			logger.Info("Using custom client cache size", zap.Int("capacity", cacheCapacity))
+		}
+	}
+
+	cacheTTL := 30 * time.Minute // Default: 30 minutes
+	if ttlStr := os.Getenv("SLACK_MCP_CLIENT_CACHE_TTL"); ttlStr != "" {
+		if ttl, err := time.ParseDuration(ttlStr); err == nil && ttl > 0 {
+			cacheTTL = ttl
+			logger.Info("Using custom client cache TTL", zap.Duration("ttl", cacheTTL))
+		}
+	}
+	
+	// Create TokenBasedApiProvider with LRU cache
+	tap := &TokenBasedApiProvider{
+		ApiProvider: baseProvider,
+		clientCache: cache.NewLRUCache(cacheCapacity, cacheTTL, logger),
+	}
+	
 	// Check for environment variable token for backward compatibility
 	oauthToken := os.Getenv("SLACK_OAUTH_TOKEN")
 	if oauthToken == "" {
@@ -359,7 +410,10 @@ func New(transport string, logger *zap.Logger) *TokenBasedApiProvider {
 		logger.Info("No environment OAuth token found - will extract tokens from HTTP Authorization headers")
 	}
 
-	return &TokenBasedApiProvider{ApiProvider: baseProvider}
+	// Start periodic cache stats logging
+	go tap.logCacheStats()
+
+	return tap
 }
 
 // newBaseProvider creates a base ApiProvider without a client
@@ -399,6 +453,180 @@ func (tap *TokenBasedApiProvider) RefreshUsersWithContext(ctx context.Context) e
 func (tap *TokenBasedApiProvider) SetClient(client SlackAPI) {
     tap.ApiProvider.client = client
 }
+
+// logCacheStats periodically logs cache statistics for monitoring
+func (tap *TokenBasedApiProvider) logCacheStats() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		hits, misses, evictions, size := tap.clientCache.Stats()
+		if hits > 0 || misses > 0 {
+			hitRate := float64(0)
+			if hits+misses > 0 {
+				hitRate = float64(hits) / float64(hits+misses) * 100
+			}
+			tap.logger.Info("Client cache statistics",
+				zap.Uint64("hits", hits),
+				zap.Uint64("misses", misses),
+				zap.Uint64("evictions", evictions),
+				zap.Int("current_size", size),
+				zap.Float64("hit_rate_percent", hitRate),
+			)
+		}
+	}
+}
+
+// FetchUsersForRequest fetches users for a specific request without storing in shared state
+func (tap *TokenBasedApiProvider) FetchUsersForRequest(ctx context.Context, client SlackAPI) (*UsersCache, error) {
+	users := make(map[string]slack.User)
+	usersInv := make(map[string]string)
+	
+	tap.logger.Debug("FetchUsersForRequest called - fetching from Slack API")
+
+	// Fetch regular users
+	userList, err := client.GetUsersContext(ctx, slack.GetUsersOptionLimit(1000))
+	if err != nil {
+		tap.logger.Error("Failed to fetch users", zap.Error(err))
+		return nil, err
+	}
+
+	for _, user := range userList {
+		users[user.ID] = user
+		usersInv[user.Name] = user.ID
+	}
+
+	// Fetch Slack Connect users
+	slackConnectUsers, err := tap.fetchSlackConnectUsers(ctx, client, users)
+	if err != nil {
+		tap.logger.Error("Failed to fetch Slack Connect users", zap.Error(err))
+		// Don't fail the whole request, just log the error
+	} else {
+		for _, user := range slackConnectUsers {
+			users[user.ID] = user
+			usersInv[user.Name] = user.ID
+		}
+	}
+
+	tap.logger.Debug("Fetched users for request", zap.Int("count", len(users)))
+
+	return &UsersCache{
+		Users:    users,
+		UsersInv: usersInv,
+	}, nil
+}
+
+// fetchSlackConnectUsers fetches Slack Connect shared users
+func (tap *TokenBasedApiProvider) fetchSlackConnectUsers(ctx context.Context, client SlackAPI, existingUsers map[string]slack.User) ([]slack.User, error) {
+	boot, err := client.ClientUserBoot(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var collectedIDs []string
+	for _, im := range boot.IMs {
+		if !im.IsShared && !im.IsExtShared {
+			continue
+		}
+
+		if _, ok := existingUsers[im.User]; !ok {
+			collectedIDs = append(collectedIDs, im.User)
+		}
+	}
+
+	if len(collectedIDs) == 0 {
+		return []slack.User{}, nil
+	}
+
+	usersInfo, err := client.GetUsersInfo(strings.Join(collectedIDs, ","))
+	if err != nil {
+		return nil, err
+	}
+
+	return *usersInfo, nil
+}
+
+// FetchChannelsForRequest fetches channels for a specific request without storing in shared state
+func (tap *TokenBasedApiProvider) FetchChannelsForRequest(ctx context.Context, client SlackAPI, users *UsersCache, channelTypes []string) (*ChannelsCache, error) {
+	if len(channelTypes) == 0 {
+		channelTypes = AllChanTypes
+	}
+
+	channels := make(map[string]Channel)
+	channelsInv := make(map[string]string)
+
+	tap.logger.Debug("FetchChannelsForRequest called", zap.Strings("channelTypes", channelTypes))
+
+	// Fetch all channel types
+	for _, chanType := range AllChanTypes {
+		chans, err := tap.fetchChannelsByType(ctx, client, chanType, users.Users)
+		if err != nil {
+			tap.logger.Error("Failed to fetch channels", zap.String("type", chanType), zap.Error(err))
+			continue
+		}
+
+		for _, ch := range chans {
+			channels[ch.ID] = ch
+			channelsInv[ch.Name] = ch.ID
+		}
+	}
+
+	tap.logger.Debug("Fetched channels for request", zap.Int("count", len(channels)))
+
+	return &ChannelsCache{
+		Channels:    channels,
+		ChannelsInv: channelsInv,
+	}, nil
+}
+
+// fetchChannelsByType fetches channels of a specific type
+func (tap *TokenBasedApiProvider) fetchChannelsByType(ctx context.Context, client SlackAPI, channelType string, usersMap map[string]slack.User) ([]Channel, error) {
+	params := &slack.GetConversationsParameters{
+		Types:           []string{channelType},
+		Limit:           999,
+		ExcludeArchived: true,
+	}
+
+	var result []Channel
+
+	for {
+		if err := tap.rateLimiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+
+		slackChannels, nextCursor, err := client.GetConversationsContext(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, channel := range slackChannels {
+			ch := mapChannel(
+				channel.ID,
+				channel.Name,
+				channel.NameNormalized,
+				channel.Topic.Value,
+				channel.Purpose.Value,
+				channel.User,
+				channel.Members,
+				channel.NumMembers,
+				channel.IsIM,
+				channel.IsMpIM,
+				channel.IsPrivate,
+				usersMap,
+			)
+			result = append(result, ch)
+		}
+
+		if nextCursor == "" {
+			break
+		}
+
+		params.Cursor = nextCursor
+	}
+
+	return result, nil
+}
+
 
 func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	var (

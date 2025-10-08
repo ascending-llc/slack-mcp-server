@@ -3,10 +3,7 @@ FROM golang:1.24 AS build
 ENV CGO_ENABLED=0
 ENV GOTOOLCHAIN=local
 ENV GOCACHE=/go/pkg/mod
-ENV SLACK_MCP_HOST=0.0.0.0
-ENV SLACK_MCP_PORT=3001
-ENV SLACK_MCP_LOG_LEVEL=debug
-ENV SLACK_WORKSPACE_NAME=ascending-club
+
 
 RUN apt-get update  \
   && apt-get install -y --no-install-recommends net-tools curl
@@ -29,15 +26,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 WORKDIR /app/mcp-server
 
-EXPOSE 3001
+EXPOSE 3334
 
 CMD ["mcp-server", "--transport", "http"]
 
 FROM alpine:3.22 AS production
-ENV SLACK_MCP_HOST=0.0.0.0
-ENV SLACK_MCP_PORT=3001
-ENV SLACK_MCP_LOG_LEVEL=debug
-ENV SLACK_WORKSPACE_NAME=ascending-club
 
 RUN apk add --no-cache ca-certificates net-tools curl
 
@@ -45,6 +38,6 @@ COPY --from=build /go/bin/mcp-server /usr/local/bin/mcp-server
 
 WORKDIR /app
 
-EXPOSE 3001
+EXPOSE 3334
 
 CMD ["mcp-server", "--transport", "http"]

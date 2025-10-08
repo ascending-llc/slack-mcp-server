@@ -4,6 +4,7 @@ import (
     "context"
     "encoding/json"
     "fmt"
+    "io"
     "net/http"
     "os"
     "strings"
@@ -253,6 +254,8 @@ func (s *MCPServer) ServeHTTP(addr string) error {
             ctx = auth.AuthFromRequest(s.logger)(ctx, r)
             return ctx
         }),
+        // Enable heartbeat to prevent 60s timeout disconnections
+        server.WithHeartbeatInterval(30*time.Second),
     )
 
     // Create HTTP mux with authentication middleware
@@ -268,9 +271,24 @@ func (s *MCPServer) ServeHTTP(addr string) error {
         w.Write([]byte(`{"status":"ok"}`))
     })
 
+    // Create HTTP server with proper timeout configuration for long-lived SSE connections
+    httpServer := &http.Server{
+        Addr:              addr,
+        Handler:           mux,
+        ReadHeaderTimeout: 30 * time.Second,
+        // DO NOT set ReadTimeout or WriteTimeout - they will kill SSE streaming connections!
+        // The heartbeat mechanism (configured above) keeps connections alive
+        IdleTimeout:       120 * time.Second,
+        MaxHeaderBytes:    1 << 20, // 1 MB
+    }
+
     // Start server
-    s.logger.Info("HTTP server listening", zap.String("address", addr))
-    return http.ListenAndServe(addr, mux)
+    s.logger.Info("HTTP server listening", 
+        zap.String("address", addr),
+        zap.String("heartbeat_interval", "30s"),
+        zap.String("idle_timeout", "120s"),
+    )
+    return httpServer.ListenAndServe()
 }
 
 func (s *MCPServer) ServeStdio() error {
@@ -317,8 +335,7 @@ func (s *MCPServer) httpAuthMiddleware(next http.Handler) http.Handler {
             zap.String("method", r.Method),
             zap.String("path", r.URL.Path),
         )
-		 // Print all headers
-        fmt.Printf("Request: %+v\n", r)
+
 		// Handle CORS preflight (OPTIONS) requests - no auth required
         if r.Method == http.MethodOptions {
             s.logger.Debug("CORS preflight request, skipping auth",
@@ -334,30 +351,62 @@ func (s *MCPServer) httpAuthMiddleware(next http.Handler) http.Handler {
 
         // Only check authentication for POST and HEAD requests
 		if r.Method == http.MethodPost || r.Method == http.MethodHead {
-			s.logger.Debug("Checking authentication",
-				zap.String("method", r.Method),
+			// Extract MCP method from request body for logging
+			var mcpMethod string
+			if r.Method == http.MethodPost {
+				bodyBytes, err := io.ReadAll(r.Body)
+				if err == nil {
+					var reqBody map[string]interface{}
+					if json.Unmarshal(bodyBytes, &reqBody) == nil {
+						if method, ok := reqBody["method"].(string); ok {
+							mcpMethod = method
+						}
+					}
+					// Restore body for subsequent reads
+					r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+				}
+			}
+
+			s.logger.Debug("Processing MCP request",
+				zap.String("http_method", r.Method),
+				zap.String("mcp_method", mcpMethod),
 			)
 
-			// Check Authorization header
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				s.sendHTTP401(w, "missing_authorization",
-					"Missing authorization header",
-					"Include 'Authorization: Bearer <token>' header in your request")
-				return
+			// Check if this is a tools/list request by peeking at the request body
+			// We need to allow tools/list without authentication for MCP protocol discovery
+			if mcpMethod == "tools/list" {
+				s.logger.Debug("Skipping authentication for tools/list request")
+				// Continue to handler without auth check
+			} else {
+				s.logger.Debug("Checking authentication",
+					zap.String("method", r.Method),
+					zap.String("mcp_method", mcpMethod),
+				)
+
+				// Check Authorization header
+				authHeader := r.Header.Get("Authorization")
+				if authHeader == "" {
+					s.sendHTTP401(w, "missing_authorization",
+						"Missing authorization header",
+						"Include 'Authorization: Bearer <token>' header in your request")
+					return
+				}
+
+				s.logger.Debug("DEBUG: Authorization header received", zap.String("auth_header", authHeader))
+
+				// Extract and validate token
+				token := strings.TrimPrefix(authHeader, "Bearer ")
+				s.logger.Debug("DEBUG: Access token for validation", zap.String("token", token))
+				
+				if !s.validateToken(token) {
+					s.sendHTTP401(w, "invalid_token",
+						"Invalid or expired token",
+						"Check your token validity or refresh your OAuth token")
+					return
+				}
+
+				s.logger.Debug("HTTP authentication successful")
 			}
-
-
-			// Extract and validate token
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if !s.validateToken(token) {
-				s.sendHTTP401(w, "invalid_token",
-					"Invalid or expired token",
-					"Check your token validity or refresh your OAuth token")
-				return
-			}
-
-			s.logger.Debug("HTTP authentication successful")
 		} else {
 			s.logger.Debug("Skipping authentication for method",
 				zap.String("method", r.Method),
@@ -396,12 +445,51 @@ func (s *MCPServer) sendHTTP401(w http.ResponseWriter, errorType, message, hint 
     json.NewEncoder(w).Encode(response)
 }
 
+// isToolsListRequest checks if the request is for tools/list method
+func (s *MCPServer) isToolsListRequest(r *http.Request) bool {
+    // Read the body to check the method
+    var reqBody map[string]interface{}
+    if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+        s.logger.Debug("Failed to decode request body", zap.Error(err))
+        return false
+    }
+    
+    // Re-create the body so it can be read again by the handler
+    bodyBytes, _ := json.Marshal(reqBody)
+    r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+    
+    // Check if method is "tools/list"
+    method, ok := reqBody["method"].(string)
+    if ok && method == "tools/list" {
+        s.logger.Debug("Detected tools/list request")
+        return true
+    }
+    
+    return false
+}
+
 // validateToken validates the OAuth token with Slack API
 func (s *MCPServer) validateToken(token string) bool {
+    s.logger.Debug("DEBUG: Starting token validation with Slack API", zap.String("token", token))
+    
     api := slack.New(token)
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
     
-    _, err := api.AuthTestContext(ctx)
-    return err == nil
+    authResp, err := api.AuthTestContext(ctx)
+    if err != nil {
+        s.logger.Debug("DEBUG: Token validation FAILED", 
+            zap.String("token", token),
+            zap.Error(err))
+        return false
+    }
+    
+    s.logger.Debug("DEBUG: Token validation SUCCESSFUL", 
+        zap.String("token", token),
+        zap.String("user", authResp.User),
+        zap.String("user_id", authResp.UserID),
+        zap.String("team", authResp.Team),
+        zap.String("team_id", authResp.TeamID))
+    
+    return true
 }
