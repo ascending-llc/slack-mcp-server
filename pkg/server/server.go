@@ -26,6 +26,16 @@ type MCPServer struct {
 	logger *zap.Logger
 }
 
+// getHeartbeatInterval returns the heartbeat interval from environment variable or default (30s)
+func getHeartbeatInterval() time.Duration {
+	if envVar := os.Getenv("SLACK_MCP_HEARTBEAT_INTERVAL"); envVar != "" {
+		if interval, err := time.ParseDuration(envVar); err == nil {
+			return interval
+		}
+	}
+	return 30 * time.Second
+}
+
 func NewMCPServer(provider *provider.TokenBasedApiProvider, logger *zap.Logger) *MCPServer {
 	s := server.NewMCPServer(
 		"Slack MCP Server",
@@ -221,22 +231,70 @@ func NewMCPServer(provider *provider.TokenBasedApiProvider, logger *zap.Logger) 
 	}
 }
 
-func (s *MCPServer) ServeSSE(addr string) *server.SSEServer {
+func (s *MCPServer) ServeSSE(addr string) error {
 	s.logger.Info("Creating SSE server",
 		zap.String("context", "console"),
 		zap.String("version", version.Version),
 		zap.String("build_time", version.BuildTime),
 		zap.String("commit_hash", version.CommitHash),
 		zap.String("address", addr),
+		zap.String("transport", "SSE"),
 	)
-	return server.NewSSEServer(s.server,
+	
+	// Create SSE server with full configuration
+	sseServer := server.NewSSEServer(s.server,
 		server.WithBaseURL(fmt.Sprintf("http://%s", addr)),
+		server.WithStaticBasePath(""),          // No base path prefix
+		server.WithSSEEndpoint("/sse"),         // GET requests for SSE stream
+		server.WithMessageEndpoint("/message"), // POST requests for messages
+		server.WithKeepAlive(true),
+		server.WithKeepAliveInterval(getHeartbeatInterval()), // Keep connections alive
 		server.WithSSEContextFunc(func(ctx context.Context, r *http.Request) context.Context {
+			// Add auth context for all SSE requests
 			ctx = auth.AuthFromRequest(s.logger)(ctx, r)
-
 			return ctx
 		}),
 	)
+
+	// Create a custom handler that adds auth middleware before SSE server
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.logger.Info("Incoming request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.String("user-agent", r.Header.Get("User-Agent")),
+		)
+		
+		// Health check endpoint (no auth required)
+		if r.URL.Path == "/health" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		
+		// All SSE/message requests go through auth middleware then to SSE server
+		s.httpAuthMiddleware(sseServer).ServeHTTP(w, r)
+	})
+
+	// Create HTTP server with proper timeout configuration for SSE
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           handler,  // Use the custom handler directly
+		ReadHeaderTimeout: 30 * time.Second,
+		// DO NOT set ReadTimeout or WriteTimeout - they will kill SSE connections!
+		// IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB
+	}
+
+	s.logger.Info("SSE server listening", 
+		zap.String("address", addr),
+		zap.String("sse_endpoint", "/sse"),
+		zap.String("message_endpoint", "/message"),
+		zap.String("keep_alive_interval", getHeartbeatInterval().String()),
+		zap.String("idle_timeout", "120s"),
+	)
+	
+	return httpServer.ListenAndServe()
 }
 
 func (s *MCPServer) ServeHTTP(addr string) error {
@@ -247,7 +305,9 @@ func (s *MCPServer) ServeHTTP(addr string) error {
 		zap.String("commit_hash", version.CommitHash),
 		zap.String("address", addr),
 	)
-	mcpServer := server.NewStreamableHTTPServer(s.server,
+	
+	mcpServer := server.NewStreamableHTTPServer(s.server, 
+		server.WithStateLess(false),
         server.WithEndpointPath("/mcp"),
         server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
             // Extract auth token and add to context
@@ -255,14 +315,31 @@ func (s *MCPServer) ServeHTTP(addr string) error {
             return ctx
         }),
         // Enable heartbeat to prevent 60s timeout disconnections
-        server.WithHeartbeatInterval(30*time.Second),
+        server.WithHeartbeatInterval(getHeartbeatInterval()),
     )
 
     // Create HTTP mux with authentication middleware
     mux := http.NewServeMux()
     
     // Add authenticated MCP endpoint
-    mux.Handle("/mcp", s.httpAuthMiddleware(mcpServer))
+    // Wrap the MCP server with a handler that logs what's happening
+	mux.Handle("/mcp", s.httpAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.logger.Info("MCP endpoint called",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.String("content-type", r.Header.Get("Content-Type")),
+			zap.String("accept", r.Header.Get("Accept")),
+			zap.String("session-id", r.Header.Get("Mcp-Session-Id")),
+		)
+		
+		// Let StreamableHTTPServer handle it
+		mcpServer.ServeHTTP(w, r)
+		
+		s.logger.Info("MCP response sent",
+			zap.String("method", r.Method),
+			zap.String("response-content-type", w.Header().Get("Content-Type")),
+		)
+	})))
     
     // Add health check endpoint (no auth required)
     mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -285,7 +362,7 @@ func (s *MCPServer) ServeHTTP(addr string) error {
     // Start server
     s.logger.Info("HTTP server listening", 
         zap.String("address", addr),
-        zap.String("heartbeat_interval", "30s"),
+        zap.String("heartbeat_interval", getHeartbeatInterval().String()),
         zap.String("idle_timeout", "120s"),
     )
     return httpServer.ListenAndServe()
@@ -336,90 +413,103 @@ func (s *MCPServer) httpAuthMiddleware(next http.Handler) http.Handler {
             zap.String("path", r.URL.Path),
         )
 
-		// Handle CORS preflight (OPTIONS) requests - no auth required
+        // Handle CORS preflight
         if r.Method == http.MethodOptions {
-            s.logger.Debug("CORS preflight request, skipping auth",
-                zap.String("origin", r.Header.Get("Origin")),
-            )
+            s.logger.Debug("CORS preflight request, skipping auth")
             w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-            w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, HEAD")
-            w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-            w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
-            w.WriteHeader(http.StatusNoContent) // 204 No Content
+            w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, HEAD, DELETE")
+            w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Mcp-Session-Id")
+            w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
+            w.Header().Set("Access-Control-Max-Age", "86400")
+            w.WriteHeader(http.StatusNoContent)
             return
         }
 
-        // Only check authentication for POST and HEAD requests
-		if r.Method == http.MethodPost || r.Method == http.MethodHead {
-			// Extract MCP method from request body for logging
-			var mcpMethod string
-			if r.Method == http.MethodPost {
-				bodyBytes, err := io.ReadAll(r.Body)
-				if err == nil {
-					var reqBody map[string]interface{}
-					if json.Unmarshal(bodyBytes, &reqBody) == nil {
-						if method, ok := reqBody["method"].(string); ok {
-							mcpMethod = method
-						}
-					}
-					// Restore body for subsequent reads
-					r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
-				}
-			}
+        // GET requests are for SSE streams - require authentication
+        if r.Method == http.MethodGet {
+            s.logger.Debug("GET request for SSE stream",
+                zap.String("session_id", r.URL.Query().Get("sessionId")),
+            )
+            
+            // Check authentication for SSE GET requests
+            authHeader := r.Header.Get("Authorization")
+            if authHeader == "" {
+                s.sendHTTP401(w, "missing_authorization",
+                    "Missing authorization header for SSE stream",
+                    "Include 'Authorization: Bearer <token>' header in your SSE request")
+                return
+            }
 
-			s.logger.Debug("Processing MCP request",
-				zap.String("http_method", r.Method),
-				zap.String("mcp_method", mcpMethod),
-			)
+            token := strings.TrimPrefix(authHeader, "Bearer ")
+            if !s.validateToken(token) {
+                s.sendHTTP401(w, "invalid_token",
+                    "Invalid or expired token for SSE stream",
+                    "Check your token validity or refresh your OAuth token")
+                return
+            }
+            
+            s.logger.Debug("SSE stream authentication successful", 
+                zap.String("session_id", r.URL.Query().Get("sessionId")))
+            
+            // Add CORS headers
+            if origin := r.Header.Get("Origin"); origin != "" {
+                w.Header().Set("Access-Control-Allow-Origin", origin)
+                w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
+            }
+            
+            // Let the StreamableHTTPServer handle the GET request
+            next.ServeHTTP(w, r)
+            return
+        }
 
-			// Check if this is a tools/list request by peeking at the request body
-			// We need to allow tools/list without authentication for MCP protocol discovery
-			if mcpMethod == "tools/list" {
-				s.logger.Debug("Skipping authentication for tools/list request")
-				// Continue to handler without auth check
-			} else {
-				s.logger.Debug("Checking authentication",
-					zap.String("method", r.Method),
-					zap.String("mcp_method", mcpMethod),
-				)
+        // POST, HEAD, DELETE - check authentication
+        if r.Method == http.MethodPost || r.Method == http.MethodHead || r.Method == http.MethodDelete {
+            var mcpMethod string
+            if r.Method == http.MethodPost {
+                bodyBytes, err := io.ReadAll(r.Body)
+                if err == nil {
+                    var reqBody map[string]interface{}
+                    if json.Unmarshal(bodyBytes, &reqBody) == nil {
+                        if method, ok := reqBody["method"].(string); ok {
+                            mcpMethod = method
+                        }
+                    }
+                    r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+                }
+            }
 
-				// Check Authorization header
-				authHeader := r.Header.Get("Authorization")
-				if authHeader == "" {
-					s.sendHTTP401(w, "missing_authorization",
-						"Missing authorization header",
-						"Include 'Authorization: Bearer <token>' header in your request")
-					return
-				}
+            s.logger.Debug("Processing MCP request",
+                zap.String("http_method", r.Method),
+                zap.String("mcp_method", mcpMethod),
+            )
 
-				s.logger.Debug("DEBUG: Authorization header received", zap.String("auth_header", authHeader))
+            // Skip auth for tools/list (protocol discovery) and ping
+            if mcpMethod != "tools/list" && mcpMethod != "ping" {
+                authHeader := r.Header.Get("Authorization")
+                if authHeader == "" {
+                    s.sendHTTP401(w, "missing_authorization",
+                        "Missing authorization header",
+                        "Include 'Authorization: Bearer <token>' header in your request")
+                    return
+                }
 
-				// Extract and validate token
-				token := strings.TrimPrefix(authHeader, "Bearer ")
-				s.logger.Debug("DEBUG: Access token for validation", zap.String("token", token))
-				
-				if !s.validateToken(token) {
-					s.sendHTTP401(w, "invalid_token",
-						"Invalid or expired token",
-						"Check your token validity or refresh your OAuth token")
-					return
-				}
+                token := strings.TrimPrefix(authHeader, "Bearer ")
+                if !s.validateToken(token) {
+                    s.sendHTTP401(w, "invalid_token",
+                        "Invalid or expired token",
+                        "Check your token validity or refresh your OAuth token")
+                    return
+                }
+            }
+        }
 
-				s.logger.Debug("HTTP authentication successful")
-			}
-		} else {
-			s.logger.Debug("Skipping authentication for method",
-				zap.String("method", r.Method),
-			)
-		}
+        // Add CORS headers
+        if origin := r.Header.Get("Origin"); origin != "" {
+            w.Header().Set("Access-Control-Allow-Origin", origin)
+            w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        }
 
-		// Add CORS headers to actual responses
-		if origin := r.Header.Get("Origin"); origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-		}
-
-		// Authentication passed (or not required), continue to MCP handler
-		next.ServeHTTP(w, r)
+        next.ServeHTTP(w, r)
     })
 }
 
