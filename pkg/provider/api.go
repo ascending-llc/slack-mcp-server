@@ -72,6 +72,8 @@ type SlackAPI interface {
 
 	// Used to get channels list from both Slack and Enterprise Grid versions
 	GetConversationsContext(ctx context.Context, params *slack.GetConversationsParameters) ([]slack.Channel, string, error)
+	GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error)
+
 
 	// Edge API methods
 	ClientUserBoot(ctx context.Context) (*edge.ClientUserBootResponse, error)
@@ -321,6 +323,10 @@ func (c *MCPSlackClient) GetConversationsContext(ctx context.Context, params *sl
 	}
 
 	return c.slackClient.GetConversationsContext(ctx, params)
+}
+
+func (c *MCPSlackClient) GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
+	return c.slackClient.GetConversationInfoContext(ctx, input)
 }
 
 func (c *MCPSlackClient) GetConversationHistoryContext(ctx context.Context, params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
@@ -600,6 +606,36 @@ func (tap *TokenBasedApiProvider) fetchChannelsByType(ctx context.Context, clien
 		}
 
 		for _, channel := range slackChannels {
+			// If NumMembers is missing or 0, fetch it separately
+            numMembers := channel.NumMembers
+            if numMembers == 0 && channel.IsGroup &&!channel.IsIM && !channel.IsMpIM {
+                tap.logger.Debug("NumMembers missing, fetching with conversations.info",
+                    zap.String("channel_id", channel.ID),
+                    zap.String("channel_name", channel.Name),
+                )
+                
+                // Rate limit before additional API call
+                if err := tap.rateLimiter.Wait(ctx); err != nil {
+                    tap.logger.Warn("Rate limiter error, using 0 for NumMembers", zap.Error(err))
+                } else {
+                    channelInfo, err := client.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
+                        ChannelID:         channel.ID,
+                        IncludeNumMembers: true,
+                    })
+                    if err != nil {
+                        tap.logger.Warn("Failed to get conversation info",
+                            zap.String("channel_id", channel.ID),
+                            zap.Error(err),
+                        )
+                    } else {
+                        numMembers = channelInfo.NumMembers
+                        tap.logger.Debug("Retrieved NumMembers from conversations.info",
+                            zap.String("channel_id", channel.ID),
+                            zap.Int("num_members", numMembers),
+                        )
+                    }
+                }
+            }
 			ch := mapChannel(
 				channel.ID,
 				channel.Name,
@@ -608,7 +644,7 @@ func (tap *TokenBasedApiProvider) fetchChannelsByType(ctx context.Context, clien
 				channel.Purpose.Value,
 				channel.User,
 				channel.Members,
-				channel.NumMembers,
+				numMembers,
 				channel.IsIM,
 				channel.IsMpIM,
 				channel.IsPrivate,
