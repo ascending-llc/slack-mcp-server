@@ -752,7 +752,6 @@ func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) 
 			break
 		}
 
-		chans = make([]Channel, 0, len(channels))
 		for _, channel := range channels {
 			ch := mapChannel(
 				channel.ID,

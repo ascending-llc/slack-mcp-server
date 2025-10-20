@@ -47,6 +47,40 @@ Instead of using browser-based tokens (`xoxc`/`xoxd`), you can use a User OAuth 
 3. Install the app to your workspace
 4. Copy the "User OAuth Token" (starts with `xoxp-`)
 
+To create the app from a manifest with permissions preconfigured, use the following code snippet:
+
+```json
+{
+    "display_information": {
+        "name": "Slack MCP"
+    },
+    "oauth_config": {
+        "scopes": {
+            "user": [
+                "channels:history",
+                "channels:read",
+                "groups:history",
+                "groups:read",
+                "im:history",
+                "im:read",
+                "im:write",
+                "mpim:history",
+                "mpim:read",
+                "mpim:write",
+                "users:read",
+                "chat:write",
+                "search:read"
+            ]
+        }
+    },
+    "settings": {
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": false,
+        "token_rotation_enabled": false
+    }
+}
+```
+
 > **Note**: You only need **either** XOXP token **or** both XOXC/XOXD tokens. XOXP user tokens are more secure and don't require browser session extraction.
 
 See next: [Installation](02-installation.md)
