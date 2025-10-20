@@ -2,15 +2,23 @@ package auth
 
 import (
 	"context"
-	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/cache"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/slack-go/slack"
 	"go.uber.org/zap"
+)
+
+var (
+	// Global validation cache - initialized on first use
+	validationCache *cache.ValidationCache
 )
 
 // authKey is a custom context key for storing the auth token.
@@ -21,51 +29,101 @@ func withAuthKey(ctx context.Context, auth string) context.Context {
 	return context.WithValue(ctx, authKey{}, auth)
 }
 
-// Authenticate checks if the request is authenticated based on the provided context.
-func validateToken(ctx context.Context, logger *zap.Logger) (bool, error) {
-	// no configured token means no authentication
-	keyA := os.Getenv("SLACK_MCP_API_KEY")
-	if keyA == "" {
-		keyA = os.Getenv("SLACK_MCP_SSE_API_KEY")
-		if keyA != "" {
-			logger.Warn("SLACK_MCP_SSE_API_KEY is deprecated, please use SLACK_MCP_API_KEY")
+// Initialize validation cache lazily
+func getValidationCache(logger *zap.Logger) *cache.ValidationCache {
+	if validationCache == nil {
+		// Get TTL from environment or use default
+		ttl := 5 * time.Minute
+		if ttlStr := os.Getenv("SLACK_MCP_AUTH_CACHE_TTL"); ttlStr != "" {
+			if ttlInt, err := strconv.Atoi(ttlStr); err == nil && ttlInt > 0 {
+				ttl = time.Duration(ttlInt) * time.Second
+				logger.Info("Using custom auth cache TTL",
+					zap.Duration("ttl", ttl))
+			}
 		}
+		validationCache = cache.NewValidationCache(ttl, logger)
+		logger.Info("Initialized validation cache",
+			zap.Duration("ttl", ttl))
+	}
+	return validationCache
+}
+
+// New OAuth token validation function with caching
+func validateOAuthToken(ctx context.Context, logger *zap.Logger) (bool, error) {
+	logger.Debug("Context information in OAuth validation")
+	token, ok := ctx.Value(authKey{}).(string)
+
+	if !ok || token == "" {
+		logger.Warn("Missing OAuth token in context")
+		return false, fmt.Errorf("missing OAuth token - please provide Authorization header")
 	}
 
-	if keyA == "" {
-		logger.Debug("No SSE API key configured, skipping authentication",
-			zap.String("context", "http"),
-		)
-		return true, nil
+	// Debug: Print the raw token
+	logger.Debug("DEBUG: Access token received", zap.String("token", token))
+
+	// Remove Bearer prefix if present
+	if strings.HasPrefix(token, "Bearer ") {
+		token = strings.TrimPrefix(token, "Bearer ")
+	}
+	
+	// Debug: Print the token after removing Bearer prefix
+	logger.Debug("DEBUG: Access token after Bearer removal", zap.String("token", token))
+	
+	// Check if token is empty after removing Bearer prefix
+	if token == "" {
+		logger.Warn("Empty OAuth token after removing Bearer prefix")
+		return false, fmt.Errorf("empty OAuth token - please provide a valid token")
 	}
 
-	keyB, ok := ctx.Value(authKey{}).(string)
-	if !ok {
-		logger.Warn("Missing auth token in context",
-			zap.String("context", "http"),
-		)
-		return false, fmt.Errorf("missing auth")
+	// Check cache first
+	vc := getValidationCache(logger)
+	if result, found := vc.Get(token); found {
+		if result.Valid {
+			logger.Debug("Token validated from cache",
+				zap.String("user_id", result.UserID),
+				zap.String("team_id", result.TeamID))
+			return true, nil
+		}
+		// Cached invalid result
+		return false, fmt.Errorf("token validation failed (cached)")
 	}
 
-	logger.Debug("Validating auth token",
-		zap.String("context", "http"),
-		zap.Bool("has_bearer_prefix", strings.HasPrefix(keyB, "Bearer ")),
-	)
+	// Cache miss - validate with Slack API
+	return validateWithSlack(token, logger, vc)
+}
 
-	if strings.HasPrefix(keyB, "Bearer ") {
-		keyB = strings.TrimPrefix(keyB, "Bearer ")
+// Validate token by calling Slack's auth.test API and cache the result
+func validateWithSlack(token string, logger *zap.Logger, vc *cache.ValidationCache) (bool, error) {
+	api := slack.New(token)
+
+	// Test the token by calling auth.test
+	authTest, err := api.AuthTest()
+	if err != nil {
+		logger.Warn("Slack API auth.test failed", zap.Error(err))
+		
+		// Cache the invalid result (with shorter TTL via the cache's default)
+		vc.Set(token, &cache.ValidationResult{
+			Valid: false,
+		})
+		
+		return false, fmt.Errorf("token validation failed: %v", err)
 	}
 
-	if subtle.ConstantTimeCompare([]byte(keyA), []byte(keyB)) != 1 {
-		logger.Warn("Invalid auth token provided",
-			zap.String("context", "http"),
-		)
-		return false, fmt.Errorf("invalid auth token")
-	}
+	// Cache the valid result
+	vc.Set(token, &cache.ValidationResult{
+		Valid:  true,
+		Team:   authTest.Team,
+		User:   authTest.User,
+		UserID: authTest.UserID,
+		TeamID: authTest.TeamID,
+	})
 
-	logger.Debug("Auth token validated successfully",
-		zap.String("context", "http"),
-	)
+	logger.Debug("Token validated with Slack API (cache miss)",
+		zap.String("team", authTest.Team),
+		zap.String("user", authTest.User),
+		zap.String("user_id", authTest.UserID),
+		zap.String("team_id", authTest.TeamID))
+
 	return true, nil
 }
 
@@ -86,6 +144,12 @@ func BuildMiddleware(transport string, logger *zap.Logger) server.ToolHandlerMid
 				zap.String("transport", transport),
 				zap.String("tool", req.Params.Name),
 			)
+
+			// Skip auth check for HTTP transport - it's already handled by httpAuthMiddleware
+			if transport == "http" {
+				logger.Debug("Skipping BuildMiddleware auth for HTTP transport (handled by httpAuthMiddleware)")
+				return next(ctx, req)
+			}
 
 			if authenticated, err := IsAuthenticated(ctx, transport, logger); !authenticated {
 				logger.Error("Authentication failed",
@@ -115,7 +179,7 @@ func IsAuthenticated(ctx context.Context, transport string, logger *zap.Logger) 
 		return true, nil
 
 	case "sse", "http":
-		authenticated, err := validateToken(ctx, logger)
+		authenticated, err := validateOAuthToken(ctx, logger)
 
 		if err != nil {
 			logger.Error("HTTP/SSE authentication error",
@@ -141,4 +205,10 @@ func IsAuthenticated(ctx context.Context, transport string, logger *zap.Logger) 
 		)
 		return false, fmt.Errorf("unknown transport type: %s", transport)
 	}
+}
+
+// GetTokenFromContext extracts the token from context (public API)
+func GetTokenFromContext(ctx context.Context) (string, bool) {
+    token, ok := ctx.Value(authKey{}).(string)
+    return token, ok
 }

@@ -1,0 +1,110 @@
+name: Deploy MCP to EKS
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'AWS Region to deploy to'
+        type: string
+        required: true
+        default: us-east-1
+      application:
+        description: 'Application to deploy to'
+        type: choice
+        required: true
+        default: jarvis-demo
+        options:
+          - jarvis
+          - jarvis-demo
+      version:
+        description: 'MCP version to deploy'
+        type: string
+        required: false
+        default: latest
+
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  build_and_test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set IAM role to assume
+        id: set-role
+        run: |
+          echo "role=${{ secrets.SAAS_AWS_DEPLOY_ROLE_ARN }}" >> $GITHUB_OUTPUT
+
+
+      - name: Assume IAM role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.set-role.outputs.role }}
+          role-session-name: deployment-role-session
+          aws-region: ${{ inputs.region }}
+
+      - name: Test AWS Connection
+        run: aws sts get-caller-identity
+
+  deploy-backend:
+    name: Deploy Backend to EKS
+    runs-on: ubuntu-latest
+    needs: build_and_test
+    env:
+      SAAS_EKS_CLUSTER_NAME: ascending-s-api-cluster
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: latest
+
+      - name: Set IAM role to assume
+        id: set-role
+        run: |
+          echo "role=${{ secrets.SAAS_AWS_DEPLOY_ROLE_ARN }}" >> $GITHUB_OUTPUT
+
+
+      - name: Assume IAM role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.set-role.outputs.role }}
+          role-session-name: deployment-role-session
+          aws-region: ${{ inputs.region }}
+
+      - name: AWS ECR HELM Connection
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: "897729109735"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SAAS_EKS_CLUSTER_NAME }} --region ${{ inputs.region }}
+
+
+      - name: Sync librechat env variables
+        env:
+          AWS_REGION: ${{ inputs.region }}
+          APP_NAME: ${{ inputs.application }}
+        run: |
+          echo "Updating env vars in EKS pods..."
+          kubectl annotate es jarvis-env force-sync=$(date +%s) --overwrite -n ${{ inputs.application }}
+
+      - name: Update deployment on EKS
+        env:
+          image: ${{ steps.login-ecr.outputs.registry }}/jarvis/slack_mcp_server:${{ inputs.version }}
+        run: kubectl set image deploy/slack-mcp slack-mcp=$image -n ${{ inputs.application }}
+
+
+      - name: restart pods
+        run: |
+          kubectl rollout restart deploy/slack-mcp -n ${{ inputs.application }}
+
+      - name: Check pod status
+        run: |
+          kubectl rollout status deploy/slack-mcp -n ${{ inputs.application }}

@@ -2,15 +2,22 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
+	// "encoding/json"
 	"errors"
-	"io/ioutil"
+	"fmt"
+	// "io/ioutil"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/cache"
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider/edge"
 	"github.com/korotovsky/slack-mcp-server/pkg/transport"
+	localauth "github.com/korotovsky/slack-mcp-server/pkg/server/auth"
 	"github.com/rusq/slackdump/v3/auth"
 	"github.com/slack-go/slack"
 	"go.uber.org/zap"
@@ -91,13 +98,76 @@ type ApiProvider struct {
 
 	users      map[string]slack.User
 	usersInv   map[string]string
-	usersCache string
+	// usersCache string
 	usersReady bool
 
 	channels      map[string]Channel
 	channelsInv   map[string]string
-	channelsCache string
+	// channelsCache string
 	channelsReady bool
+}
+
+// TokenBasedApiProvider supports creating clients from tokens dynamically
+type TokenBasedApiProvider struct {
+	*ApiProvider
+	
+	// LRU cache for per-token clients (replaces unbounded map)
+	clientCache *cache.LRUCache
+	cacheMutex  sync.RWMutex
+}
+
+// CreateClientFromToken creates a new Slack client from an OAuth token
+func (tap *TokenBasedApiProvider) CreateClientFromToken(oauthToken string) (SlackAPI, error) {
+	return NewMCPSlackClientFromToken(oauthToken, tap.logger)
+}
+
+// GetClientFromContext extracts token from context and creates/returns appropriate client
+func (tap *TokenBasedApiProvider) GetClientFromContext(ctx context.Context) (SlackAPI, error) {
+	// Check if we have a static client (from environment variables)
+	if tap.client != nil {
+		return tap.client, nil
+	}
+
+	// Extract token from context (set by AuthFromRequest)
+	token, ok := localauth.GetTokenFromContext(ctx)
+	if !ok {
+		return nil, fmt.Errorf("no authentication token found in context")
+	}
+
+	// Remove Bearer prefix if present
+	if strings.HasPrefix(token, "Bearer ") {
+		token = strings.TrimPrefix(token, "Bearer ")
+	}
+
+	// Check cache first
+	if cachedClient, found := tap.clientCache.Get(token); found {
+		tap.logger.Debug("Using cached client for token")
+		return cachedClient.(SlackAPI), nil
+	}
+
+	// Need to create new client
+	tap.cacheMutex.Lock()
+	defer tap.cacheMutex.Unlock()
+
+	// Double-check pattern - another goroutine may have created it
+	if cachedClient, found := tap.clientCache.Get(token); found {
+		tap.logger.Debug("Using cached client for token (from double-check)")
+		return cachedClient.(SlackAPI), nil
+	}
+
+	// Create new client
+	tap.logger.Debug("Creating new client for token")
+	client, err := tap.CreateClientFromToken(token)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache it
+	tap.clientCache.Set(token, client)
+	tap.logger.Debug("Cached new client for token",
+		zap.Int("cache_size", tap.clientCache.Len()))
+
+	return client, nil
 }
 
 func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlackClient, error) {
@@ -112,6 +182,31 @@ func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlac
 		return nil, err
 	}
 
+	return createMCPSlackClient(slackClient, authResp, authProvider, httpClient, logger)
+}
+
+// NewMCPSlackClientFromToken creates a new MCP Slack client from an OAuth token
+func NewMCPSlackClientFromToken(oauthToken string, logger *zap.Logger) (*MCPSlackClient, error) {
+	// Create auth provider from token
+	authProvider, err := auth.NewValueAuth(oauthToken, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create auth provider: %w", err)
+	}
+
+	httpClient := transport.ProvideHTTPClient(authProvider.Cookies(), logger)
+
+	slackClient := slack.New(oauthToken, slack.OptionHTTPClient(httpClient))
+
+	authResp, err := slackClient.AuthTest()
+	if err != nil {
+		return nil, fmt.Errorf("token validation failed: %w", err)
+	}
+
+	return createMCPSlackClient(slackClient, authResp, authProvider, httpClient, logger)
+}
+
+// createMCPSlackClient is a helper function to create MCPSlackClient from components
+func createMCPSlackClient(slackClient *slack.Client, authResp *slack.AuthTestResponse, authProvider auth.Provider, httpClient *http.Client, logger *zap.Logger) (*MCPSlackClient, error) {
 	authResponse := &slack.AuthTestResponse{
 		URL:          authResp.URL,
 		Team:         authResp.Team,
@@ -142,24 +237,12 @@ func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlac
 		authResponse: authResponse,
 		authProvider: authProvider,
 		isEnterprise: isEnterprise,
-		isOAuth:      strings.HasPrefix(authProvider.SlackToken(), "xoxp-"),
+		isOAuth:      true, // Always OAuth since we only support OAuth tokens now
 		teamEndpoint: authResp.URL,
 	}, nil
 }
 
 func (c *MCPSlackClient) AuthTest() (*slack.AuthTestResponse, error) {
-	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
-		return &slack.AuthTestResponse{
-			URL:          "https://_.slack.com",
-			Team:         "Demo Team",
-			User:         "Username",
-			TeamID:       "TEAM123456",
-			UserID:       "U1234567890",
-			EnterpriseID: "",
-			BotID:        "",
-		}, nil
-	}
-
 	if c.authResponse != nil {
 		return c.authResponse, nil
 	}
@@ -281,122 +364,269 @@ func (c *MCPSlackClient) Raw() struct {
 	}
 }
 
-func New(transport string, logger *zap.Logger) *ApiProvider {
-	var (
-		authProvider auth.ValueAuth
-		err          error
-	)
-
-	// Check for XOXP token first (User OAuth)
-	xoxpToken := os.Getenv("SLACK_MCP_XOXP_TOKEN")
-	if xoxpToken != "" {
-		authProvider, err = auth.NewValueAuth(xoxpToken, "")
-		if err != nil {
-			logger.Fatal("Failed to create auth provider with XOXP token", zap.Error(err))
+func New(transport string, logger *zap.Logger) *TokenBasedApiProvider {
+	// Create base provider
+	baseProvider := newBaseProvider(transport, logger)
+	
+	// Get cache configuration from environment
+	cacheCapacity := 100 // Default: 100 clients
+	if capacityStr := os.Getenv("SLACK_MCP_CLIENT_CACHE_SIZE"); capacityStr != "" {
+		if capacity, err := strconv.Atoi(capacityStr); err == nil && capacity > 0 {
+			cacheCapacity = capacity
+			logger.Info("Using custom client cache size", zap.Int("capacity", cacheCapacity))
 		}
-
-		return newWithXOXP(transport, authProvider, logger)
 	}
 
-	// Fall back to XOXC/XOXD tokens (session-based)
-	xoxcToken := os.Getenv("SLACK_MCP_XOXC_TOKEN")
-	xoxdToken := os.Getenv("SLACK_MCP_XOXD_TOKEN")
-
-	if xoxcToken == "" || xoxdToken == "" {
-		logger.Fatal("Authentication required: Either SLACK_MCP_XOXP_TOKEN (User OAuth) or both SLACK_MCP_XOXC_TOKEN and SLACK_MCP_XOXD_TOKEN (session-based) environment variables must be provided")
+	cacheTTL := 30 * time.Minute // Default: 30 minutes
+	if ttlStr := os.Getenv("SLACK_MCP_CLIENT_CACHE_TTL"); ttlStr != "" {
+		if ttl, err := time.ParseDuration(ttlStr); err == nil && ttl > 0 {
+			cacheTTL = ttl
+			logger.Info("Using custom client cache TTL", zap.Duration("ttl", cacheTTL))
+		}
+	}
+	
+	// Create TokenBasedApiProvider with LRU cache
+	tap := &TokenBasedApiProvider{
+		ApiProvider: baseProvider,
+		clientCache: cache.NewLRUCache(cacheCapacity, cacheTTL, logger),
+	}
+	
+	// Check for environment variable token for backward compatibility
+	oauthToken := os.Getenv("SLACK_OAUTH_TOKEN")
+	if oauthToken == "" {
+		// Fallback to legacy environment variable name
+		oauthToken = os.Getenv("SLACK_MCP_XOXP_TOKEN")
 	}
 
-	authProvider, err = auth.NewValueAuth(xoxcToken, xoxdToken)
+	// If token found in environment, create client immediately
+	if oauthToken != "" {
+		client, err := NewMCPSlackClientFromToken(oauthToken, logger)
+		if err != nil {
+			logger.Fatal("Failed to create MCP Slack client from environment token", zap.Error(err))
+		}
+		baseProvider.client = client
+		logger.Info("Initialized with OAuth token from environment variables")
+	} else {
+		logger.Info("No environment OAuth token found - will extract tokens from HTTP Authorization headers")
+	}
+
+	// Start periodic cache stats logging
+	go tap.logCacheStats()
+
+	return tap
+}
+
+// newBaseProvider creates a base ApiProvider without a client
+func newBaseProvider(transport string, logger *zap.Logger) *ApiProvider {
+
+	return &ApiProvider{
+		transport: transport,
+		client:    nil, // Will be set dynamically from tokens
+		logger:    logger,
+
+		rateLimiter: limiter.Tier2.Limiter(),
+
+		users:      make(map[string]slack.User),
+		usersInv:   map[string]string{},
+		// usersCache: usersCache,
+
+		channels:      make(map[string]Channel),
+		channelsInv:   map[string]string{},
+		// channelsCache: channelsCache,
+	}
+}
+
+func (tap *TokenBasedApiProvider) RefreshUsersWithContext(ctx context.Context) error {
+    client, err := tap.GetClientFromContext(ctx)
+    if err != nil {
+        return err
+    }
+    
+    // Temporarily set client for refresh
+    originalClient := tap.client
+    tap.client = client
+    defer func() { tap.client = originalClient }()
+    
+    return tap.RefreshUsers(ctx)
+}
+
+func (tap *TokenBasedApiProvider) SetClient(client SlackAPI) {
+    tap.ApiProvider.client = client
+}
+
+// logCacheStats periodically logs cache statistics for monitoring
+func (tap *TokenBasedApiProvider) logCacheStats() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		hits, misses, evictions, size := tap.clientCache.Stats()
+		if hits > 0 || misses > 0 {
+			hitRate := float64(0)
+			if hits+misses > 0 {
+				hitRate = float64(hits) / float64(hits+misses) * 100
+			}
+			tap.logger.Info("Client cache statistics",
+				zap.Uint64("hits", hits),
+				zap.Uint64("misses", misses),
+				zap.Uint64("evictions", evictions),
+				zap.Int("current_size", size),
+				zap.Float64("hit_rate_percent", hitRate),
+			)
+		}
+	}
+}
+
+// FetchUsersForRequest fetches users for a specific request without storing in shared state
+func (tap *TokenBasedApiProvider) FetchUsersForRequest(ctx context.Context, client SlackAPI) (*UsersCache, error) {
+	users := make(map[string]slack.User)
+	usersInv := make(map[string]string)
+	
+	tap.logger.Debug("FetchUsersForRequest called - fetching from Slack API")
+
+	// Fetch regular users
+	userList, err := client.GetUsersContext(ctx, slack.GetUsersOptionLimit(1000))
 	if err != nil {
-		logger.Fatal("Failed to create auth provider with XOXC/XOXD tokens", zap.Error(err))
+		tap.logger.Error("Failed to fetch users", zap.Error(err))
+		return nil, err
 	}
 
-	return newWithXOXC(transport, authProvider, logger)
-}
-
-func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
-	var (
-		client *MCPSlackClient
-		err    error
-	)
-
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
+	for _, user := range userList {
+		users[user.ID] = user
+		usersInv[user.Name] = user.ID
 	}
 
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache_v2.json"
-	}
-
-	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
-		logger.Info("Demo credentials are set, skip.")
+	// Fetch Slack Connect users
+	slackConnectUsers, err := tap.fetchSlackConnectUsers(ctx, client, users)
+	if err != nil {
+		tap.logger.Error("Failed to fetch Slack Connect users", zap.Error(err))
+		// Don't fail the whole request, just log the error
 	} else {
-		client, err = NewMCPSlackClient(authProvider, logger)
-		if err != nil {
-			logger.Fatal("Failed to create MCP Slack client", zap.Error(err))
+		for _, user := range slackConnectUsers {
+			users[user.ID] = user
+			usersInv[user.Name] = user.ID
 		}
 	}
 
-	return &ApiProvider{
-		transport: transport,
-		client:    client,
-		logger:    logger,
+	tap.logger.Debug("Fetched users for request", zap.Int("count", len(users)))
 
-		rateLimiter: limiter.Tier2.Limiter(),
-
-		users:      make(map[string]slack.User),
-		usersInv:   map[string]string{},
-		usersCache: usersCache,
-
-		channels:      make(map[string]Channel),
-		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
-	}
+	return &UsersCache{
+		Users:    users,
+		UsersInv: usersInv,
+	}, nil
 }
 
-func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
-	var (
-		client *MCPSlackClient
-		err    error
-	)
-
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
+// fetchSlackConnectUsers fetches Slack Connect shared users
+func (tap *TokenBasedApiProvider) fetchSlackConnectUsers(ctx context.Context, client SlackAPI, existingUsers map[string]slack.User) ([]slack.User, error) {
+	boot, err := client.ClientUserBoot(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache_v2.json"
-	}
+	var collectedIDs []string
+	for _, im := range boot.IMs {
+		if !im.IsShared && !im.IsExtShared {
+			continue
+		}
 
-	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
-		logger.Info("Demo credentials are set, skip.")
-	} else {
-		client, err = NewMCPSlackClient(authProvider, logger)
-		if err != nil {
-			logger.Fatal("Failed to create MCP Slack client", zap.Error(err))
+		if _, ok := existingUsers[im.User]; !ok {
+			collectedIDs = append(collectedIDs, im.User)
 		}
 	}
 
-	return &ApiProvider{
-		transport: transport,
-		client:    client,
-		logger:    logger,
-
-		rateLimiter: limiter.Tier2.Limiter(),
-
-		users:      make(map[string]slack.User),
-		usersInv:   map[string]string{},
-		usersCache: usersCache,
-
-		channels:      make(map[string]Channel),
-		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+	if len(collectedIDs) == 0 {
+		return []slack.User{}, nil
 	}
+
+	usersInfo, err := client.GetUsersInfo(strings.Join(collectedIDs, ","))
+	if err != nil {
+		return nil, err
+	}
+
+	return *usersInfo, nil
 }
+
+// FetchChannelsForRequest fetches channels for a specific request without storing in shared state
+func (tap *TokenBasedApiProvider) FetchChannelsForRequest(ctx context.Context, client SlackAPI, users *UsersCache, channelTypes []string) (*ChannelsCache, error) {
+	if len(channelTypes) == 0 {
+		channelTypes = AllChanTypes
+	}
+
+	channels := make(map[string]Channel)
+	channelsInv := make(map[string]string)
+
+	tap.logger.Debug("FetchChannelsForRequest called", zap.Strings("channelTypes", channelTypes))
+
+	// Fetch all channel types
+	for _, chanType := range AllChanTypes {
+		chans, err := tap.fetchChannelsByType(ctx, client, chanType, users.Users)
+		if err != nil {
+			tap.logger.Error("Failed to fetch channels", zap.String("type", chanType), zap.Error(err))
+			continue
+		}
+
+		for _, ch := range chans {
+			channels[ch.ID] = ch
+			channelsInv[ch.Name] = ch.ID
+		}
+	}
+
+	tap.logger.Debug("Fetched channels for request", zap.Int("count", len(channels)))
+
+	return &ChannelsCache{
+		Channels:    channels,
+		ChannelsInv: channelsInv,
+	}, nil
+}
+
+// fetchChannelsByType fetches channels of a specific type
+func (tap *TokenBasedApiProvider) fetchChannelsByType(ctx context.Context, client SlackAPI, channelType string, usersMap map[string]slack.User) ([]Channel, error) {
+	params := &slack.GetConversationsParameters{
+		Types:           []string{channelType},
+		Limit:           999,
+		ExcludeArchived: true,
+	}
+
+	var result []Channel
+
+	for {
+		if err := tap.rateLimiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+
+		slackChannels, nextCursor, err := client.GetConversationsContext(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, channel := range slackChannels {
+			ch := mapChannel(
+				channel.ID,
+				channel.Name,
+				channel.NameNormalized,
+				channel.Topic.Value,
+				channel.Purpose.Value,
+				channel.User,
+				channel.Members,
+				channel.NumMembers,
+				channel.IsIM,
+				channel.IsMpIM,
+				channel.IsPrivate,
+				usersMap,
+			)
+			result = append(result, ch)
+		}
+
+		if nextCursor == "" {
+			break
+		}
+
+		params.Cursor = nextCursor
+	}
+
+	return result, nil
+}
+
 
 func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	var (
@@ -405,28 +635,12 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
 
-	if data, err := ioutil.ReadFile(ap.usersCache); err == nil {
-		var cachedUsers []slack.User
-		if err := json.Unmarshal(data, &cachedUsers); err != nil {
-			ap.logger.Warn("Failed to unmarshal users cache, will refetch",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			for _, u := range cachedUsers {
-				ap.users[u.ID] = u
-				ap.usersInv[u.Name] = u.ID
-			}
-			ap.logger.Info("Loaded users from cache",
-				zap.Int("count", len(cachedUsers)),
-				zap.String("cache_file", ap.usersCache))
-			ap.usersReady = true
-			return nil
-		}
-	}
+	ap.logger.Debug("RefreshUsers called - fetching from Slack API")
 
 	users, err := ap.client.GetUsersContext(ctx,
 		optionLimit,
 	)
+	ap.logger.Debug("GetUsersContext called") 
 	if err != nil {
 		ap.logger.Error("Failed to fetch users", zap.Error(err))
 		return err
@@ -453,20 +667,8 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		ap.usersInv[user.Name] = user.ID
 		usersCounter++
 	}
-
-	if data, err := json.MarshalIndent(list, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal users for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.usersCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote users to cache",
-				zap.Int("count", usersCounter),
-				zap.String("cache_file", ap.usersCache))
-		}
-	}
+	ap.logger.Info("Loaded users from Slack API",
+        zap.Int("count", usersCounter))
 
 	ap.usersReady = true
 
@@ -474,41 +676,11 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 }
 
 func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
-	if data, err := ioutil.ReadFile(ap.channelsCache); err == nil {
-		var cachedChannels []Channel
-		if err := json.Unmarshal(data, &cachedChannels); err != nil {
-			ap.logger.Warn("Failed to unmarshal channels cache, will refetch",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			for _, c := range cachedChannels {
-				ap.channels[c.ID] = c
-				ap.channelsInv[c.Name] = c.ID
-			}
-			ap.logger.Info("Loaded channels from cache",
-				zap.Int("count", len(cachedChannels)),
-				zap.String("cache_file", ap.channelsCache))
-			ap.channelsReady = true
-			return nil
-		}
-	}
 
 	channels := ap.GetChannels(ctx, AllChanTypes)
 
-	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.channelsCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote channels to cache",
-				zap.Int("count", len(channels)),
-				zap.String("cache_file", ap.channelsCache))
-		}
-	}
-
+	ap.logger.Info("Loaded channels from Slack API",
+        zap.Int("count", len(channels)))
 	ap.channelsReady = true
 
 	return nil

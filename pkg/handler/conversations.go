@@ -80,15 +80,45 @@ type addMessageParams struct {
 }
 
 type ConversationsHandler struct {
-	apiProvider *provider.ApiProvider
+	apiProvider *provider.TokenBasedApiProvider
 	logger      *zap.Logger
 }
 
-func NewConversationsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger) *ConversationsHandler {
+func NewConversationsHandler(apiProvider *provider.TokenBasedApiProvider, logger *zap.Logger) *ConversationsHandler {
 	return &ConversationsHandler{
 		apiProvider: apiProvider,
 		logger:      logger,
 	}
+}
+
+// getClientAndCaches is a helper method to get client and optionally fetch user/channel caches
+func (ch *ConversationsHandler) getClientAndCaches(ctx context.Context, needUsers, needChannels bool) (client provider.SlackAPI, users *provider.UsersCache, channels *provider.ChannelsCache, err error) {
+	client, err = ch.apiProvider.GetClientFromContext(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if needUsers {
+		users, err = ch.apiProvider.FetchUsersForRequest(ctx, client)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	if needChannels {
+		if users == nil {
+			users, err = ch.apiProvider.FetchUsersForRequest(ctx, client)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+		channels, err = ch.apiProvider.FetchChannelsForRequest(ctx, client, users, provider.AllChanTypes)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	return client, users, channels, nil
 }
 
 // UsersResource streams a CSV of all users
@@ -101,14 +131,22 @@ func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.R
 		return nil, err
 	}
 
-	// provider readiness
-	if ready, err := ch.apiProvider.IsReady(); !ready {
-		ch.logger.Error("API provider not ready", zap.Error(err))
+	// Get client for this request (cached by token)
+	client, err := ch.apiProvider.GetClientFromContext(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to get client from context", zap.Error(err))
+		return nil, err
+	}
+
+	// Fetch users for this request only
+	usersCache, err := ch.apiProvider.FetchUsersForRequest(ctx, client)
+	if err != nil {
+		ch.logger.Error("Failed to fetch users", zap.Error(err))
 		return nil, err
 	}
 
 	// Slack auth test
-	ar, err := ch.apiProvider.Slack().AuthTest()
+	ar, err := client.AuthTest()
 	if err != nil {
 		ch.logger.Error("Slack AuthTest failed", zap.Error(err))
 		return nil, err
@@ -124,7 +162,7 @@ func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.R
 	}
 
 	// collect users
-	usersMaps := ch.apiProvider.ProvideUsersMap()
+	usersMaps := usersCache
 	users := usersMaps.Users
 	usersList := make([]User, 0, len(users))
 	for _, user := range users {
@@ -155,7 +193,14 @@ func (ch *ConversationsHandler) UsersResource(ctx context.Context, request mcp.R
 func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsAddMessageHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolAddMessage(request)
+	// Get client, users, and channels for this request
+	client, users, channels, err := ch.getClientAndCaches(ctx, true, true)
+	if err != nil {
+		ch.logger.Error("Failed to get client and caches", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolAddMessage(request, channels)
 	if err != nil {
 		ch.logger.Error("Failed to parse add-message params", zap.Error(err))
 		return nil, err
@@ -196,7 +241,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		zap.String("thread_ts", params.threadTs),
 		zap.String("content_type", params.contentType),
 	)
-	respChannel, respTimestamp, err := ch.apiProvider.Slack().PostMessageContext(ctx, params.channel, options...)
+	respChannel, respTimestamp, err := client.PostMessageContext(ctx, params.channel, options...)
 	if err != nil {
 		ch.logger.Error("Slack PostMessageContext failed", zap.Error(err))
 		return nil, err
@@ -204,7 +249,7 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 
 	toolConfig := os.Getenv("SLACK_MCP_ADD_MESSAGE_MARK")
 	if toolConfig == "1" || toolConfig == "true" || toolConfig == "yes" {
-		err := ch.apiProvider.Slack().MarkConversationContext(ctx, params.channel, respTimestamp)
+		err := client.MarkConversationContext(ctx, params.channel, respTimestamp)
 		if err != nil {
 			ch.logger.Error("Slack MarkConversationContext failed", zap.Error(err))
 			return nil, err
@@ -219,14 +264,14 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		Latest:    respTimestamp,
 		Inclusive: true,
 	}
-	history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+	history, err := client.GetConversationHistoryContext(ctx, &historyParams)
 	if err != nil {
 		ch.logger.Error("GetConversationHistoryContext failed", zap.Error(err))
 		return nil, err
 	}
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, historyParams.ChannelID, false)
+	messages := ch.convertMessagesFromHistory(history.Messages, historyParams.ChannelID, false, users)
 	return marshalMessagesToCSV(messages)
 }
 
@@ -234,7 +279,14 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsHistoryHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolConversations(request)
+	// Get client, users, and channels for this request
+	client, users, channels, err := ch.getClientAndCaches(ctx, true, true)
+	if err != nil {
+		ch.logger.Error("Failed to get client and caches", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolConversations(request, channels)
 	if err != nil {
 		ch.logger.Error("Failed to parse history params", zap.Error(err))
 		return nil, err
@@ -255,7 +307,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 		Cursor:    params.cursor,
 		Inclusive: false,
 	}
-	history, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &historyParams)
+	history, err := client.GetConversationHistoryContext(ctx, &historyParams)
 	if err != nil {
 		ch.logger.Error("GetConversationHistoryContext failed", zap.Error(err))
 		return nil, err
@@ -263,7 +315,7 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(history.Messages, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(history.Messages, params.channel, params.activity, users)
 
 	if len(messages) > 0 && history.HasMore {
 		messages[len(messages)-1].Cursor = history.ResponseMetaData.NextCursor
@@ -275,7 +327,14 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsRepliesHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolConversations(request)
+	// Get client, users, and channels for this request
+	client, users, channels, err := ch.getClientAndCaches(ctx, true, true)
+	if err != nil {
+		ch.logger.Error("Failed to get client and caches", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolConversations(request, channels)
 	if err != nil {
 		ch.logger.Error("Failed to parse replies params", zap.Error(err))
 		return nil, err
@@ -295,14 +354,14 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 		Cursor:    params.cursor,
 		Inclusive: false,
 	}
-	replies, hasMore, nextCursor, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
+	replies, hasMore, nextCursor, err := client.GetConversationRepliesContext(ctx, &repliesParams)
 	if err != nil {
 		ch.logger.Error("GetConversationRepliesContext failed", zap.Error(err))
 		return nil, err
 	}
 	ch.logger.Debug("Fetched conversation replies", zap.Int("count", len(replies)))
 
-	messages := ch.convertMessagesFromHistory(replies, params.channel, params.activity)
+	messages := ch.convertMessagesFromHistory(replies, params.channel, params.activity, users)
 	if len(messages) > 0 && hasMore {
 		messages[len(messages)-1].Cursor = nextCursor
 	}
@@ -312,7 +371,14 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsSearchHandler called", zap.Any("params", request.Params))
 
-	params, err := ch.parseParamsToolSearch(request)
+	// Get client, users, and channels for this request
+	client, users, channels, err := ch.getClientAndCaches(ctx, true, true)
+	if err != nil {
+		ch.logger.Error("Failed to get client and caches", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolSearch(request, users, channels)
 	if err != nil {
 		ch.logger.Error("Failed to parse search params", zap.Error(err))
 		return nil, err
@@ -326,14 +392,14 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 		Count:         params.limit,
 		Page:          params.page,
 	}
-	messagesRes, _, err := ch.apiProvider.Slack().SearchContext(ctx, params.query, searchParams)
+	messagesRes, _, err := client.SearchContext(ctx, params.query, searchParams)
 	if err != nil {
 		ch.logger.Error("Slack SearchContext failed", zap.Error(err))
 		return nil, err
 	}
 	ch.logger.Debug("Search completed", zap.Int("matches", len(messagesRes.Matches)))
 
-	messages := ch.convertMessagesFromSearch(messagesRes.Matches)
+	messages := ch.convertMessagesFromSearch(messagesRes.Matches, users)
 	if len(messages) > 0 && messagesRes.Pagination.Page < messagesRes.Pagination.PageCount {
 		nextCursor := fmt.Sprintf("page:%d", messagesRes.Pagination.Page+1)
 		messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
@@ -363,8 +429,7 @@ func isChannelAllowed(channel string) bool {
 	return !isNegated
 }
 
-func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack.Message, channel string, includeActivity bool) []Message {
-	usersMap := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack.Message, channel string, includeActivity bool, usersMap *provider.UsersCache) []Message {
 	var messages []Message
 	warn := false
 
@@ -421,8 +486,7 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(slackMessages []slack
 	return messages
 }
 
-func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.SearchMessage) []Message {
-	usersMap := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.SearchMessage, usersMap *provider.UsersCache) []Message {
 	var messages []Message
 	warn := false
 
@@ -469,7 +533,7 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(slackMessages []slack.
 	return messages
 }
 
-func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToolRequest) (*conversationParams, error) {
+func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToolRequest, channelsMaps *provider.ChannelsCache) (*conversationParams, error) {
 	channel := request.GetString("channel_id", "")
 	if channel == "" {
 		ch.logger.Error("channel_id missing in conversations params")
@@ -500,27 +564,12 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 		}
 	}
 
-	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
-		if ready, err := ch.apiProvider.IsReady(); !ready {
-			if errors.Is(err, provider.ErrUsersNotReady) {
-				ch.logger.Warn(
-					"WARNING: Slack users sync is not ready yet, you may experience some limited functionality and see UIDs instead of resolved names as well as unable to query users by their @handles. Users sync is part of channels sync and operations on channels depend on users collection (IM, MPIM). Please wait until users are synced and try again",
-					zap.Error(err),
-				)
-			}
-			if errors.Is(err, provider.ErrChannelsNotReady) {
-				ch.logger.Warn(
-					"WARNING: Slack channels sync is not ready yet, you may experience some limited functionality and be able to request conversation only by Channel ID, not by its name. Please wait until channels are synced and try again.",
-					zap.Error(err),
-				)
-			}
-			return nil, fmt.Errorf("channel %q not found in empty cache", channel)
-		}
-		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+	// Resolve channel name to ID if needed
+	if channelsMaps != nil && (strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@")) {
 		chn, ok := channelsMaps.ChannelsInv[channel]
 		if !ok {
-			ch.logger.Error("Channel not found in synced cache", zap.String("channel", channel))
-			return nil, fmt.Errorf("channel %q not found in synced cache. Try to remove old cache file and restart MCP Server", channel)
+			ch.logger.Error("Channel not found", zap.String("channel", channel))
+			return nil, fmt.Errorf("channel %q not found", channel)
 		}
 		channel = channelsMaps.Channels[chn].ID
 	}
@@ -535,7 +584,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 	}, nil
 }
 
-func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRequest) (*addMessageParams, error) {
+func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRequest, channelsMaps *provider.ChannelsCache) (*addMessageParams, error) {
 	toolConfig := os.Getenv("SLACK_MCP_ADD_MESSAGE_TOOL")
 	if toolConfig == "" {
 		ch.logger.Error("Add-message tool disabled by default")
@@ -552,8 +601,8 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRe
 		ch.logger.Error("channel_id missing in add-message params")
 		return nil, errors.New("channel_id must be a string")
 	}
-	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
-		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+	// Resolve channel name to ID if needed
+	if channelsMaps != nil && (strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@")) {
 		chn, ok := channelsMaps.ChannelsInv[channel]
 		if !ok {
 			ch.logger.Error("Channel not found", zap.String("channel", channel))
@@ -592,7 +641,7 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(request mcp.CallToolRe
 	}, nil
 }
 
-func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (*searchParams, error) {
+func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest, users *provider.UsersCache, channels *provider.ChannelsCache) (*searchParams, error) {
 	rawQuery := strings.TrimSpace(req.GetString("search_query", ""))
 	freeText, filters := splitQuery(rawQuery)
 
@@ -600,14 +649,14 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "is", "thread")
 	}
 	if chName := req.GetString("filter_in_channel", ""); chName != "" {
-		f, err := ch.paramFormatChannel(chName)
+		f, err := ch.paramFormatChannel(chName, channels)
 		if err != nil {
 			ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
 			return nil, err
 		}
 		addFilter(filters, "in", f)
 	} else if im := req.GetString("filter_in_im_or_mpim", ""); im != "" {
-		f, err := ch.paramFormatUser(im)
+		f, err := ch.paramFormatUser(im, users)
 		if err != nil {
 			ch.logger.Error("Invalid IM/MPIM filter", zap.String("filter", im), zap.Error(err))
 			return nil, err
@@ -615,7 +664,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "in", f)
 	}
 	if with := req.GetString("filter_users_with", ""); with != "" {
-		f, err := ch.paramFormatUser(with)
+		f, err := ch.paramFormatUser(with, users)
 		if err != nil {
 			ch.logger.Error("Invalid with-user filter", zap.String("filter", with), zap.Error(err))
 			return nil, err
@@ -623,7 +672,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 		addFilter(filters, "with", f)
 	}
 	if from := req.GetString("filter_users_from", ""); from != "" {
-		f, err := ch.paramFormatUser(from)
+		f, err := ch.paramFormatUser(from, users)
 		if err != nil {
 			ch.logger.Error("Invalid from-user filter", zap.String("filter", from), zap.Error(err))
 			return nil, err
@@ -685,8 +734,7 @@ func (ch *ConversationsHandler) parseParamsToolSearch(req mcp.CallToolRequest) (
 	}, nil
 }
 
-func (ch *ConversationsHandler) paramFormatUser(raw string) (string, error) {
-	users := ch.apiProvider.ProvideUsersMap()
+func (ch *ConversationsHandler) paramFormatUser(raw string, users *provider.UsersCache) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if strings.HasPrefix(raw, "U") {
 		u, ok := users.Users[raw]
@@ -708,19 +756,18 @@ func (ch *ConversationsHandler) paramFormatUser(raw string) (string, error) {
 	return fmt.Sprintf("<@%s>", uid), nil
 }
 
-func (ch *ConversationsHandler) paramFormatChannel(raw string) (string, error) {
+func (ch *ConversationsHandler) paramFormatChannel(raw string, channels *provider.ChannelsCache) (string, error) {
 	raw = strings.TrimSpace(raw)
-	cms := ch.apiProvider.ProvideChannelsMaps()
 	if strings.HasPrefix(raw, "#") {
-		if id, ok := cms.ChannelsInv[raw]; ok {
-			return cms.Channels[id].Name, nil
+		if id, ok := channels.ChannelsInv[raw]; ok {
+			return "#" + channels.Channels[id].Name, nil
 		}
 		return "", fmt.Errorf("channel %q not found", raw)
 	}
 	// Handle both C (standard channels) and G (private groups/channels) prefixes
 	if strings.HasPrefix(raw, "C") || strings.HasPrefix(raw, "G") {
-		if chn, ok := cms.Channels[raw]; ok {
-			return chn.Name, nil
+		if chn, ok := channels.Channels[raw]; ok {
+			return "#" + chn.Name, nil
 		}
 		return "", fmt.Errorf("channel %q not found", raw)
 	}

@@ -25,12 +25,12 @@ type Channel struct {
 }
 
 type ChannelsHandler struct {
-	apiProvider *provider.ApiProvider
+	apiProvider *provider.TokenBasedApiProvider
 	validTypes  map[string]bool
 	logger      *zap.Logger
 }
 
-func NewChannelsHandler(apiProvider *provider.ApiProvider, logger *zap.Logger) *ChannelsHandler {
+func NewChannelsHandler(apiProvider *provider.TokenBasedApiProvider, logger *zap.Logger) *ChannelsHandler {
 	validTypes := make(map[string]bool, len(provider.AllChanTypes))
 	for _, v := range provider.AllChanTypes {
 		validTypes[v] = true
@@ -52,14 +52,30 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 		return nil, err
 	}
 
-	var channelList []Channel
-
-	if ready, err := ch.apiProvider.IsReady(); !ready {
-		ch.logger.Error("API provider not ready", zap.Error(err))
+	// Get client for this request (cached by token)
+	client, err := ch.apiProvider.GetClientFromContext(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to get client from context", zap.Error(err))
 		return nil, err
 	}
 
-	ar, err := ch.apiProvider.Slack().AuthTest()
+	// Fetch users for this request only
+	usersCache, err := ch.apiProvider.FetchUsersForRequest(ctx, client)
+	if err != nil {
+		ch.logger.Error("Failed to fetch users", zap.Error(err))
+		return nil, err
+	}
+
+	// Fetch channels for this request only
+	channelsCache, err := ch.apiProvider.FetchChannelsForRequest(ctx, client, usersCache, provider.AllChanTypes)
+	if err != nil {
+		ch.logger.Error("Failed to fetch channels", zap.Error(err))
+		return nil, err
+	}
+
+	var channelList []Channel
+
+	ar, err := client.AuthTest()
 	if err != nil {
 		ch.logger.Error("Auth test failed", zap.Error(err))
 		return nil, err
@@ -74,8 +90,8 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 		return nil, fmt.Errorf("failed to parse workspace from URL: %v", err)
 	}
 
-	channels := ch.apiProvider.ProvideChannelsMaps().Channels
-	ch.logger.Debug("Retrieved channels from provider", zap.Int("count", len(channels)))
+	channels := channelsCache.Channels
+	ch.logger.Debug("Retrieved channels from request", zap.Int("count", len(channels)))
 
 	for _, channel := range channels {
 		channelList = append(channelList, Channel{
@@ -105,10 +121,35 @@ func (ch *ChannelsHandler) ChannelsResource(ctx context.Context, request mcp.Rea
 func (ch *ChannelsHandler) ChannelsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ChannelsHandler called")
 
-	if ready, err := ch.apiProvider.IsReady(); !ready {
-		ch.logger.Error("API provider not ready", zap.Error(err))
+	// authentication
+	if authenticated, err := auth.IsAuthenticated(ctx, ch.apiProvider.ServerTransport(), ch.logger); !authenticated {
+		ch.logger.Error("Authentication failed for ChannelsHandler", zap.Error(err))
 		return nil, err
 	}
+	ch.logger.Debug("ChannelsHandler Authentication successful")
+
+	// Get client for this request (cached by token)
+	client, err := ch.apiProvider.GetClientFromContext(ctx)
+	if err != nil {
+		ch.logger.Error("Failed to get client from context", zap.Error(err))
+		return nil, err
+	}
+
+	// Fetch users for this request only
+	usersCache, err := ch.apiProvider.FetchUsersForRequest(ctx, client)
+	if err != nil {
+		ch.logger.Error("Failed to fetch users", zap.Error(err))
+		return nil, err
+	}
+
+	// Fetch channels for this request only
+	channelsCache, err := ch.apiProvider.FetchChannelsForRequest(ctx, client, usersCache, provider.AllChanTypes)
+	if err != nil {
+		ch.logger.Error("Failed to fetch channels", zap.Error(err))
+		return nil, err
+	}
+
+	ch.logger.Debug("ChannelsHandler data fetch complete")
 
 	sortType := request.GetString("sort", "popularity")
 	types := request.GetString("channel_types", provider.PubChanType)
@@ -156,7 +197,7 @@ func (ch *ChannelsHandler) ChannelsHandler(ctx context.Context, request mcp.Call
 		channelList []Channel
 	)
 
-	allChannels := ch.apiProvider.ProvideChannelsMaps().Channels
+	allChannels := channelsCache.Channels
 	ch.logger.Debug("Total channels available", zap.Int("count", len(allChannels)))
 
 	channels := filterChannelsByTypes(allChannels, channelTypes)

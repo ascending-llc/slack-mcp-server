@@ -442,9 +442,24 @@ func ProvideHTTPClient(cookies []*http.Cookie, logger *zap.Logger) *http.Client 
 
 	transport = NewUserAgentTransport(transport, userAgent, cookies, logger)
 
+	// Get timeout from environment variable, default to 30 seconds
+	timeout := 30 * time.Second
+	if timeoutStr := os.Getenv("SLACK_MCP_REQUEST_TIMEOUT"); timeoutStr != "" {
+		if timeoutDuration, err := time.ParseDuration(timeoutStr); err == nil {
+			timeout = timeoutDuration
+			logger.Debug("Using custom request timeout",
+				zap.Duration("timeout", timeout))
+		} else {
+			logger.Warn("Invalid SLACK_MCP_REQUEST_TIMEOUT format, using default",
+				zap.String("value", timeoutStr),
+				zap.Duration("default", timeout),
+				zap.Error(err))
+		}
+	}
+
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   30 * time.Second,
+		Timeout:   timeout,
 	}
 
 	return client
